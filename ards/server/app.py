@@ -11,11 +11,26 @@ from fastapi.templating import Jinja2Templates
 from ards.models import ResourceRegistration, ResourceType, SearchResponse
 from ards.registry import registry
 
+from ards.server.interfaces import router as interfaces_router
+from ards.server.verifier import verifier
+from ards.plugins.base import plugin_manager
+from ards.plugins.gcp_plugins import BigQueryRegistryAuditPlugin, VertexAISearchPlugin
+
+from ards.server.registration_ui import register_router
+
 app = FastAPI(
     title="ARDS: Agent & Resource Directory Service",
     description="Decentralized discovery engine for A2A Agents, MCP Servers, Skills, and Plugins.",
     version="1.0.0",
 )
+
+# Register default plugins
+plugin_manager.register_plugin(BigQueryRegistryAuditPlugin())
+plugin_manager.register_plugin(VertexAISearchPlugin())
+
+# Mount native A2A & MCP interfaces and human/agent registration UI
+app.include_router(interfaces_router)
+app.include_router(register_router)
 
 # Seed realistic initial directory entries
 def _seed_initial_data():
@@ -144,6 +159,7 @@ GOOGLE_SEARCH_HTML = """<!DOCTYPE html>
       <span class="text-xs text-gray-500 hidden sm:inline">RFC-Draft Agent2Agent Directory Service</span>
     </div>
     <div class="flex items-center space-x-4 text-sm font-medium">
+      <a href="/register" class="text-blue-600 hover:text-blue-700 font-semibold bg-blue-50 px-3 py-1 rounded-md border border-blue-100">+ Register Resource</a>
       <a href="/api/v1/resources" class="text-gray-600 hover:text-blue-600">REST API</a>
       <a href="/docs" class="text-gray-600 hover:text-blue-600">Swagger</a>
       <a href="https://github.com/msampathkumar/ards-python" target="_blank" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-1.5 rounded-md shadow-sm transition">GitHub Repo</a>
@@ -356,7 +372,15 @@ async def api_list_resources(type: Optional[str] = None):
 
 @app.post("/api/v1/resources", response_model=ResourceRegistration)
 async def api_register_resource(res: ResourceRegistration):
-    return registry.register(res)
+    # Verify endpoint and schema security
+    verified, msg = await verifier.verify(res)
+    if not verified:
+        raise HTTPException(status_code=400, detail=msg)
+
+    registered = registry.register(res)
+    # Trigger post-registration hooks (e.g., BigQuery audit stream)
+    await plugin_manager.trigger_post_registration(registered)
+    return registered
 
 
 @app.get("/api/v1/resources/{res_id}", response_model=ResourceRegistration)
