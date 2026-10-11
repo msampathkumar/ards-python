@@ -8,20 +8,52 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from contextlib import asynccontextmanager
+from fastapi import Depends
+from ards.config import settings
 from ards.models import ResourceRegistration, ResourceType, SearchResponse
 from ards.registry import registry
 
 from ards.server.interfaces import router as interfaces_router
-from ards.server.verifier import verifier
+from ards.server.security import (
+    BASE_SECURITY_HEADERS,
+    HTML_CSP,
+    require_admin,
+    takeover_error,
+)
+from ards.server.state import ops_brain
+from ards.server.verifier import is_safe_http_url, verifier
 from ards.plugins.base import plugin_manager
 from ards.plugins.gcp_plugins import BigQueryRegistryAuditPlugin, VertexAISearchPlugin
 
 from ards.server.registration_ui import register_router
 
+# Deprecated: ops_brain now lives in ards.server.state so the HTML form and the API share it.
+# ops_brain = ARDSOpsBrain(registry=registry, verifier=verifier, config=settings)
+
+MAX_PAGE_SIZE = 200
+
+
+def _parse_type(type_value: Optional[str]) -> Optional[ResourceType]:
+    if type_value and type_value.lower() in ("agent", "skill", "plugin", "mcp"):
+        return ResourceType(type_value.lower())
+    return None
+
+
+@asynccontextmanager
+async def _lifespan(app_instance: FastAPI):
+    # In default 'combined' mode, run the Ops Brain background loop inside the same process
+    if settings.mode in ("combined", "worker"):
+        ops_brain.start_background()
+    yield
+    await ops_brain.stop_background()
+
+
 app = FastAPI(
     title="ARDS: Agent & Resource Directory Service",
     description="Decentralized discovery engine for A2A Agents, MCP Servers, Skills, and Plugins.",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 # Register default plugins
@@ -32,107 +64,10 @@ plugin_manager.register_plugin(VertexAISearchPlugin())
 app.include_router(interfaces_router)
 app.include_router(register_router)
 
-# Seed realistic initial directory entries
-def _seed_initial_data():
-    seed_items = [
-        ResourceRegistration(
-            id="agent-tokyo-warehouse",
-            type=ResourceType.AGENT,
-            name="Tokyo Logistics Hub Agent",
-            description="Autonomous regional inventory controller for Asia-Pacific operations. Supports A2A protocol and local MCP data warehouse queries.",
-            endpoint="http://localhost:8001/a2a",
-            version="1.2.0",
-            tags=["warehouse", "inventory", "apac", "tokyo", "supply-chain", "logistics"],
-            capabilities=["inventory_query", "stock_allocation", "customs_manifest"],
-            provider="Global Logistics Corp APAC",
-            location="Tokyo, Japan",
-            schema_url="http://localhost:8001/.well-known/agent.json",
-            metadata={"currency": "JPY", "timezone": "Asia/Tokyo", "region": "APAC"},
-        ),
-        ResourceRegistration(
-            id="agent-london-warehouse",
-            type=ResourceType.AGENT,
-            name="London Heathrow Distribution Hub Agent",
-            description="Autonomous inventory gateway for EMEA territories. Manages cross-docking, bonded storage, and automated reorder triggers.",
-            endpoint="http://localhost:8002/a2a",
-            version="1.1.4",
-            tags=["warehouse", "inventory", "emea", "london", "uk", "logistics"],
-            capabilities=["inventory_query", "reorder_trigger", "bonded_audit"],
-            provider="Global Logistics Corp EMEA",
-            location="London, United Kingdom",
-            schema_url="http://localhost:8002/.well-known/agent.json",
-            metadata={"currency": "GBP", "timezone": "Europe/London", "region": "EMEA"},
-        ),
-        ResourceRegistration(
-            id="agent-newyork-warehouse",
-            type=ResourceType.AGENT,
-            name="New York JFK Gateway Hub Agent",
-            description="Americas East primary fulfillment node. Synchronizes cold storage, high-velocity electronics, and ground freight manifests.",
-            endpoint="http://localhost:8003/a2a",
-            version="2.0.1",
-            tags=["warehouse", "inventory", "americas", "new-york", "usa", "logistics"],
-            capabilities=["inventory_query", "express_shipping", "carrier_dispatch"],
-            provider="Global Logistics Corp Americas",
-            location="New York, USA",
-            schema_url="http://localhost:8003/.well-known/agent.json",
-            metadata={"currency": "USD", "timezone": "America/New_York", "region": "Americas"},
-        ),
-        ResourceRegistration(
-            id="agent-warsaw-warehouse",
-            type=ResourceType.AGENT,
-            name="Warsaw Central Distribution Node Agent",
-            description="Central & Eastern Europe intermodal freight hub. Connects rail corridors and pan-European distribution networks.",
-            endpoint="http://localhost:8004/a2a",
-            version="1.0.8",
-            tags=["warehouse", "inventory", "europe", "warsaw", "poland", "logistics"],
-            capabilities=["inventory_query", "intermodal_routing", "pallet_tracking"],
-            provider="Global Logistics Corp CEE",
-            location="Warsaw, Poland",
-            schema_url="http://localhost:8004/.well-known/agent.json",
-            metadata={"currency": "EUR", "timezone": "Europe/Warsaw", "region": "CEE"},
-        ),
-        ResourceRegistration(
-            id="agent-delhi-warehouse",
-            type=ResourceType.AGENT,
-            name="Delhi NCR Cargo Hub Agent",
-            description="South Asia high-volume manufacturing and fulfillment node. Manages high-throughput inventory and local distribution.",
-            endpoint="http://localhost:8005/a2a",
-            version="1.3.0",
-            tags=["warehouse", "inventory", "south-asia", "delhi", "india", "logistics"],
-            capabilities=["inventory_query", "bulk_dispatch", "gst_audit"],
-            provider="Global Logistics Corp South Asia",
-            location="Delhi, India",
-            schema_url="http://localhost:8005/.well-known/agent.json",
-            metadata={"currency": "INR", "timezone": "Asia/Kolkata", "region": "South Asia"},
-        ),
-        ResourceRegistration(
-            id="mcp-sqlite-warehouse-tokyo",
-            type=ResourceType.MCP,
-            name="Tokyo Warehouse Read-Only MCP Server",
-            description="Direct database driver exposing 6 warehouse tables (inventory, products, aisles, stock_movements) over Model Context Protocol.",
-            endpoint="http://localhost:8001/mcp",
-            version="0.9.5",
-            tags=["mcp", "database", "sqlite", "read-only", "tokyo"],
-            capabilities=["schema_discovery", "execute_readonly_sql", "stock_lookup"],
-            provider="Logistics Data Platform",
-            location="Tokyo, Japan",
-            schema_url="http://localhost:8001/mcp/schema",
-        ),
-        ResourceRegistration(
-            id="skill-inventory-audit",
-            type=ResourceType.SKILL,
-            name="Global Inventory Audit & Reconciliation Skill",
-            description="Reusable multi-agent procedure for federated variance reconciliation across asynchronous warehouse nodes.",
-            endpoint="https://github.com/ards-project/skills/inventory-audit",
-            version="1.0.0",
-            tags=["skill", "audit", "reconciliation", "finance"],
-            capabilities=["variance_detection", "executive_reporting"],
-        ),
-    ]
-    for item in seed_items:
-        registry.register(item)
-
-_seed_initial_data()
+# Deprecated duplicate seeding on every import (now seeded once by SQLiteBackend when empty):
+# def _seed_initial_data():
+#     ...
+# _seed_initial_data()
 
 
 # HTML Google Search Template (Tailwind CDN, responsive, lightweight)
@@ -198,16 +133,16 @@ GOOGLE_SEARCH_HTML = """<!DOCTYPE html>
 
       <!-- Filter Chips -->
       <div class="flex flex-wrap items-center justify-center gap-2 mt-4">
-        <a href="/?q={{ query }}" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if not type_filter %}bg-gray-900 text-white border-gray-900{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">All Types</a>
-        <a href="/?q={{ query }}&type=agent" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if type_filter == 'agent' %}bg-blue-600 text-white border-blue-600{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">🤖 Agents</a>
-        <a href="/?q={{ query }}&type=mcp" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if type_filter == 'mcp' %}bg-purple-600 text-white border-purple-600{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">🔌 MCP Servers</a>
-        <a href="/?q={{ query }}&type=skill" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if type_filter == 'skill' %}bg-emerald-600 text-white border-emerald-600{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">⚡ Skills</a>
+        <a href="/?q={{ query | urlencode }}" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if not type_filter %}bg-gray-900 text-white border-gray-900{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">All Types</a>
+        <a href="/?q={{ query | urlencode }}&type=agent" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if type_filter == 'agent' %}bg-blue-600 text-white border-blue-600{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">🤖 Agents</a>
+        <a href="/?q={{ query | urlencode }}&type=mcp" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if type_filter == 'mcp' %}bg-purple-600 text-white border-purple-600{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">🔌 MCP Servers</a>
+        <a href="/?q={{ query | urlencode }}&type=skill" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if type_filter == 'skill' %}bg-emerald-600 text-white border-emerald-600{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">⚡ Skills</a>
       </div>
     </form>
 
     <!-- Stats Bar -->
     <div class="w-full flex justify-between items-center text-xs text-gray-500 mb-6 border-b border-gray-100 pb-3">
-      <span>About {{ total_results }} results ({{ execution_time_ms }} ms)</span>
+      <span>About {{ total_results }} results ({{ execution_time_ms }} ms) • Engine: <span class="font-mono text-gray-700">{{ backend_name }}</span></span>
       <span>Registry Status: <span class="text-green-600 font-semibold">● 100% Operational</span></span>
     </div>
 
@@ -235,7 +170,7 @@ GOOGLE_SEARCH_HTML = """<!DOCTYPE html>
         </div>
 
         <h3 class="text-lg font-medium text-blue-700 hover:underline cursor-pointer">
-          <a href="{{ item.endpoint }}" target="_blank">{{ item.name }}</a>
+          {% if item.endpoint is safe_url %}<a href="{{ item.endpoint }}" target="_blank" rel="noopener noreferrer">{{ item.name }}</a>{% else %}{{ item.name }}{% endif %}
         </h3>
 
         <p class="text-xs font-mono text-emerald-700 truncate mb-2">{{ item.endpoint }}</p>
@@ -267,6 +202,7 @@ GOOGLE_SEARCH_HTML = """<!DOCTYPE html>
     <div>ARDS Engine • Decentralized Discovery Protocol for Agent2Agent Meshes</div>
     <div class="flex space-x-6">
       <a href="/api/v1/resources" class="hover:underline">Catalog JSON</a>
+      <a href="/api/v1/ops/status" class="hover:underline">Ops Brain Status</a>
       <a href="https://github.com/msampathkumar/ards-python" class="hover:underline">GitHub</a>
       <a href="/docs" class="hover:underline">API Reference</a>
     </div>
@@ -277,107 +213,88 @@ GOOGLE_SEARCH_HTML = """<!DOCTYPE html>
 """
 
 
+from jinja2 import Environment
+
+_jinja_env = Environment(autoescape=True)
+# Jinja test used by the template: only http(s) endpoints become clickable links (blocks javascript: XSS).
+_jinja_env.tests["safe_url"] = is_safe_http_url
+_search_template = _jinja_env.from_string(GOOGLE_SEARCH_HTML)
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for header, value in BASE_SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    # Strict CSP only on our own HTML pages (Swagger at /docs needs its own CDN assets).
+    if request.url.path in ("/", "/register"):
+        response.headers["Content-Security-Policy"] = HTML_CSP
+    return response
+
+
+@app.get("/healthz")
+async def healthz():
+    """Liveness/readiness probe for Cloud Run, Kubernetes, and load balancers."""
+    return {"status": "ok", "backend": registry.backend.backend_name}
+
+
 @app.get("/", response_class=HTMLResponse)
-async def home(request: Request, q: str = "", type: Optional[str] = None):
+async def home(request: Request, q: str = Query("", max_length=256), type: Optional[str] = None):
     """Google-search styled discovery home page."""
-    type_filter = None
-    if type and type.lower() in ("agent", "skill", "plugin", "mcp"):
-        type_filter = ResourceType(type.lower())
+    type_filter = _parse_type(type)
 
-    resp = registry.search(query=q, type_filter=type_filter)
+    resp = registry.search(query=q, type_filter=type_filter, limit=50)
+    resp = await plugin_manager.trigger_on_search(q, resp)
 
-    # Simple server-side rendering
-    rendered = GOOGLE_SEARCH_HTML.replace("{{ query }}", q or "")
-    rendered = rendered.replace("{{ total_results }}", str(resp.total_results))
-    rendered = rendered.replace("{{ execution_time_ms }}", str(resp.execution_time_ms))
-    
-    # Handle conditional type filters in template
-    rendered = rendered.replace("{{ type_filter }}", type or "")
-    rendered = rendered.replace("{% if not type_filter %}bg-gray-900 text-white border-gray-900{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}",
-                                "bg-gray-900 text-white border-gray-900" if not type else "bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100")
-    for t in ("agent", "mcp", "skill"):
-        active_class = "bg-blue-600 text-white border-blue-600" if t == "agent" else ("bg-purple-600 text-white border-purple-600" if t == "mcp" else "bg-emerald-600 text-white border-emerald-600")
-        inactive_class = "bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100"
-        tag_str = f"{{% if type_filter == '{t}' %}}{active_class}{{% else %}}{inactive_class}{{% endif %}}"
-        rendered = rendered.replace(tag_str, active_class if type == t else inactive_class)
-
-    # Render results items dynamically
-    items_html = ""
-    for item in resp.results:
-        type_badge = "bg-blue-100 text-blue-800" if item.type == ResourceType.AGENT else ("bg-purple-100 text-purple-800" if item.type == ResourceType.MCP else "bg-green-100 text-green-800")
-        caps_html = "".join([f'<span class="text-xs bg-gray-100 text-gray-700 px-2 py-0.5 rounded font-mono">⚡ {c}</span>' for c in item.capabilities])
-        tags_html = "".join([f'<span class="text-xs bg-slate-50 text-slate-500 px-2 py-0.5 rounded border border-slate-100">#{tg}</span>' for tg in item.tags])
-        loc_html = f'<span class="text-xs text-gray-500 flex items-center">📍 {item.location}</span>' if item.location else ""
-
-        items_html += f"""
-        <div class="bg-white p-5 rounded-xl border border-gray-100 hover:border-gray-200 hover:shadow-sm transition">
-          <div class="flex items-start justify-between">
-            <div class="flex items-center space-x-2 mb-1">
-              <span class="text-xs font-semibold px-2 py-0.5 rounded-full {type_badge}">
-                {item.type.value.upper()}
-              </span>
-              {loc_html}
-              <span class="text-xs text-gray-400">• v{item.version}</span>
-            </div>
-            <span class="text-xs font-mono text-gray-400">{item.id}</span>
-          </div>
-
-          <h3 class="text-lg font-medium text-blue-700 hover:underline cursor-pointer">
-            <a href="{item.endpoint}" target="_blank">{item.name}</a>
-          </h3>
-
-          <p class="text-xs font-mono text-emerald-700 truncate mb-2">{item.endpoint}</p>
-          <p class="text-sm text-gray-600 mb-3 leading-relaxed">{item.description}</p>
-
-          <div class="flex flex-wrap gap-1.5 items-center">
-            {caps_html}
-            {tags_html}
-          </div>
-        </div>
-        """
-
-    if not resp.results:
-        items_html = """
-        <div class="text-center py-16 text-gray-500">
-          <p class="text-lg font-medium mb-1">No resources found matching your query.</p>
-          <p class="text-sm">Try searching for "Tokyo", "London", "inventory", or "mcp".</p>
-        </div>
-        """
-
-    # Replace jinja loop block
-    start_loop = rendered.find("{% for item in results %}")
-    end_loop = rendered.find("{% endfor %}") + len("{% endfor %}")
-    if start_loop != -1 and end_loop != -1:
-        rendered = rendered[:start_loop] + items_html + rendered[end_loop:]
-
+    # Deprecated manual string replacement (left raw {% if %}, {% for %}, {% endfor %} tags in HTML):
+    # rendered = GOOGLE_SEARCH_HTML.replace("{{ query }}", q or "")
+    # ...
+    rendered = _search_template.render(
+        query=q or "",
+        type_filter=type.lower() if type else "",
+        total_results=resp.total_results,
+        execution_time_ms=resp.execution_time_ms,
+        backend_name=resp.backend or registry.backend.backend_name,
+        results=resp.results,
+    )
     return HTMLResponse(rendered)
 
 
 # REST API Endpoints
 @app.get("/api/v1/search", response_model=SearchResponse)
-async def api_search(q: str = "", type: Optional[str] = None):
-    type_filter = None
-    if type and type.lower() in ("agent", "skill", "plugin", "mcp"):
-        type_filter = ResourceType(type.lower())
-    return registry.search(query=q, type_filter=type_filter)
+async def api_search(
+    q: str = Query("", max_length=256),
+    type: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+):
+    resp = registry.search(query=q, type_filter=_parse_type(type), limit=limit)
+    return await plugin_manager.trigger_on_search(q, resp)
 
 
 @app.get("/api/v1/resources")
-async def api_list_resources(type: Optional[str] = None):
-    type_filter = None
-    if type and type.lower() in ("agent", "skill", "plugin", "mcp"):
-        type_filter = ResourceType(type.lower())
-    return registry.list_all(type_filter=type_filter)
+async def api_list_resources(
+    type: Optional[str] = None,
+    limit: int = Query(MAX_PAGE_SIZE, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    items = registry.list_all(type_filter=_parse_type(type))
+    return items[offset : offset + limit]
 
 
 @app.post("/api/v1/resources", response_model=ResourceRegistration)
-async def api_register_resource(res: ResourceRegistration):
-    # Verify endpoint and schema security
-    verified, msg = await verifier.verify(res)
-    if not verified:
+async def api_register_resource(res: ResourceRegistration, request: Request):
+    # Cheap URL/SSRF policy check up front; live probing happens in the Ops Brain (non-blocking).
+    # Deprecated: `await verifier.verify(res)` probed endpoints inline (up to 4s per request).
+    ok, msg = await verifier.check_url_policy(res, allow_local=settings.allow_local_endpoints)
+    if not ok:
         raise HTTPException(status_code=400, detail=msg)
 
-    registered = registry.register(res)
+    conflict = takeover_error(registry.get(res.id), res, request)
+    if conflict:
+        raise HTTPException(status_code=409, detail=conflict)
+
+    # Route through Ops Brain (background verification by default; Pub/Sub queue if ARDS_PUBSUB_ENABLED=true)
+    registered = await ops_brain.submit_for_verification(res)
     # Trigger post-registration hooks (e.g., BigQuery audit stream)
     await plugin_manager.trigger_post_registration(registered)
     return registered
@@ -389,3 +306,32 @@ async def api_get_resource(res_id: str):
     if not res:
         raise HTTPException(status_code=404, detail="Resource not found")
     return res
+
+
+@app.delete("/api/v1/resources/{res_id}", dependencies=[Depends(require_admin)])
+async def api_delete_resource(res_id: str):
+    deleted = registry.delete(res_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    return {"deleted": True, "id": res_id}
+
+
+@app.get("/api/v1/ops/status")
+async def api_ops_status():
+    """Returns current storage backend, Pub/Sub bus, and Ops Brain statistics."""
+    return {
+        "mode": settings.mode,
+        "backend": registry.backend.backend_name,
+        "pubsub_enabled": settings.pubsub_enabled,
+        "pubsub_provider": registry.event_bus.provider_name,
+        "auto_clean": ops_brain.auto_clean,
+        "total_resources": len(registry.list_all()),
+        "ops_stats": ops_brain.stats,
+    }
+
+
+@app.post("/api/v1/ops/sweep", dependencies=[Depends(require_admin)])
+async def api_ops_sweep(auto_clean: Optional[bool] = None):
+    """Triggers an immediate validation & health sweep by the Ops Brain (admin only)."""
+    # Deprecated: temporarily flipped ops_brain.auto_clean, which raced with the background sweep loop.
+    return await ops_brain.sweep_once(auto_clean=auto_clean)

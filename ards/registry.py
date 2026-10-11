@@ -1,185 +1,222 @@
-"""ARDS In-Memory Registry with Fast Multi-Field Tokenized Search."""
+"""ARDS Registry SDK Facade with Pluggable Storage Backends and Subscription Hooks."""
 
-from typing import List, Optional, Dict, Any
+import inspect
+import re
+import threading
+from typing import Any, Callable, Dict, List, Optional
 import time
+
+from ards.config import ARDSConfig, settings
+from ards.events import EventBus, create_event_bus
 from ards.models import ResourceRegistration, ResourceType, SearchResponse
+from ards.storage import SQLiteBackend, StorageBackend, create_backend_from_config
+
+RegistrationCallback = Callable[[ResourceRegistration], Any]
+
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def make_resource_id(res_type: ResourceType, name: str) -> str:
+    """Builds a safe, stable id like 'agent-tokyo-logistics-hub' from a display name."""
+    slug = _SLUG_RE.sub("-", name.lower()).strip("-")[:100] or "resource"
+    return f"{res_type.value}-{slug}"
 
 
 class Registry:
-    def __init__(self):
-        self._resources: Dict[str, ResourceRegistration] = {}
-        self._seed_default_catalog()
+    """
+    Core ARDS Registry SDK class.
+    - By default (`Registry()`), uses a high-speed local `SQLiteBackend` (WAL + FTS5 BM25).
+    - Supports pluggable backends: `SQLiteBackend`, `BigQueryBackend`, `VertexAISearchBackend`, `HybridBackend`.
+    - Provides simple subscription decorators:
+        `@registry.on_registration` -> fires once when a NEW resource joins.
+        `@registry.on_update`       -> fires when an existing resource changes (e.g. health status).
+    """
+
+    def __init__(
+        self,
+        backend: Optional[StorageBackend] = None,
+        db_path: Optional[str] = None,
+        seed_defaults: Optional[bool] = None,
+        event_bus: Optional[EventBus] = None,
+        config: Optional[ARDSConfig] = None,
+    ):
+        self.config = config or settings
+        seed = seed_defaults if seed_defaults is not None else self.config.seed_defaults
+
+        if backend is not None:
+            self.backend = backend
+        elif db_path is not None:
+            self.backend = SQLiteBackend(db_path=db_path, seed_defaults=seed)
+        else:
+            self.backend = create_backend_from_config(self.config)
+
+        self.event_bus = event_bus or create_event_bus(self.config)
+        self._registration_callbacks: List[RegistrationCallback] = []
+        self._update_callbacks: List[RegistrationCallback] = []
+
+        # Wire EventBus events to local callbacks
+        self.event_bus.subscribe("resource.registered", self._handle_bus_registration)
+        self.event_bus.subscribe("resource.updated", self._handle_bus_update)
+
+    @staticmethod
+    async def _dispatch(callbacks: List[RegistrationCallback], payload: Dict[str, Any]) -> None:
+        try:
+            res = ResourceRegistration(**payload)
+        except Exception:
+            return
+        for cb in list(callbacks):
+            out = cb(res)
+            if inspect.isawaitable(out):
+                await out
+
+    async def _handle_bus_registration(self, topic: str, payload: Dict[str, Any]) -> None:
+        await self._dispatch(self._registration_callbacks, payload)
+
+    async def _handle_bus_update(self, topic: str, payload: Dict[str, Any]) -> None:
+        await self._dispatch(self._update_callbacks, payload)
+
+    def on_registration(self, func: RegistrationCallback) -> RegistrationCallback:
+        """
+        Decorator or method to subscribe to newly registered resources (fires once per new resource).
+
+        Example:
+            @registry.on_registration
+            async def handle_new_agent(res: ResourceRegistration):
+                print(f"New resource: {res.name}")
+        """
+        self._registration_callbacks.append(func)
+        return func
+
+    def on_update(self, func: RegistrationCallback) -> RegistrationCallback:
+        """Decorator to subscribe to changes of existing resources (re-registration, health status updates)."""
+        self._update_callbacks.append(func)
+        return func
+
+    def subscribe(self, callback: RegistrationCallback) -> RegistrationCallback:
+        """Alias for `on_registration`."""
+        return self.on_registration(callback)
 
     def register(self, res: ResourceRegistration) -> ResourceRegistration:
-        res.created_at = time.time()
-        self._resources[res.id] = res
-        return res
+        if not res.created_at:
+            res.created_at = time.time()
+        is_new = self.backend.get(res.id) is None
+        saved = self.backend.register(res)
+        # Deprecated: published "resource.registered" on every write, so subscribers were
+        # flooded on each Ops Brain health sweep. New vs. update are now separate topics.
+        # self.event_bus.publish_sync("resource.registered", saved.model_dump())
+        topic = "resource.registered" if is_new else "resource.updated"
+        self.event_bus.publish_sync(topic, saved.model_dump())
+        return saved
+
+    def submit(
+        self,
+        name: str,
+        endpoint: str,
+        type: str | ResourceType = ResourceType.AGENT,
+        description: str = "",
+        id: Optional[str] = None,
+        capabilities: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        location: Optional[str] = None,
+        provider: Optional[str] = None,
+        version: str = "1.0.0",
+        schema_url: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> ResourceRegistration:
+        """
+        Simple 1-call helper for users & agents to submit a resource to the registry without boilerplate.
+        """
+        res_type = ResourceType(type.lower()) if isinstance(type, str) else type
+        item = ResourceRegistration(
+            id=id or make_resource_id(res_type, name),
+            type=res_type,
+            name=name,
+            description=description or f"{name} ({res_type.value.upper()}) registered via ARDS SDK.",
+            endpoint=endpoint,
+            version=version,
+            capabilities=capabilities or [],
+            tags=tags or [],
+            location=location,
+            provider=provider,
+            schema_url=schema_url,
+            metadata=metadata or {},
+        )
+        return self.register(item)
 
     def get(self, res_id: str) -> Optional[ResourceRegistration]:
-        return self._resources.get(res_id)
+        return self.backend.get(res_id)
 
     def delete(self, res_id: str) -> bool:
-        if res_id in self._resources:
-            del self._resources[res_id]
-            return True
-        return False
+        deleted = self.backend.delete(res_id)
+        if deleted:
+            self.event_bus.publish_sync("resource.deleted", {"id": res_id})
+        return deleted
 
     def list_all(self, type_filter: Optional[ResourceType] = None) -> List[ResourceRegistration]:
-        items = list(self._resources.values())
-        if type_filter:
-            items = [item for item in items if item.type == type_filter]
-        return items
+        return self.backend.list_all(type_filter=type_filter)
 
-    def search(self, query: str = "", type_filter: Optional[ResourceType] = None) -> SearchResponse:
-        start_time = time.perf_counter()
-        q = query.strip().lower()
+    def search(
+        self,
+        query: str = "",
+        type_filter: Optional[ResourceType] = None,
+        limit: Optional[int] = None,
+    ) -> SearchResponse:
+        """Searches the registry. `total_results` is the full match count; `limit` caps returned items."""
+        resp = self.backend.search(query=query, type_filter=type_filter)
+        if limit is not None and limit >= 0:
+            resp.results = resp.results[:limit]
+        return resp
 
-        candidates = list(self._resources.values())
-        if type_filter:
-            candidates = [c for c in candidates if c.type == type_filter]
-
-        if not q:
-            results = candidates
-        else:
-            query_tokens = [w for w in q.split() if len(w) > 1]
-            scored_results = []
-            for item in candidates:
-                score = 0
-                searchable_text = f"{item.name} {item.description} {' '.join(item.tags)} {' '.join(item.capabilities)} {item.location or ''}".lower()
-
-                # Full phrase match
-                if q in searchable_text:
-                    score += 25
-
-                # Individual word tokens match
-                for token in query_tokens:
-                    if token in item.name.lower():
-                        score += 15
-                    if token in [t.lower() for t in item.tags]:
-                        score += 12
-                    elif token in ' '.join(item.tags).lower():
-                        score += 6
-                    if item.location and token in item.location.lower():
-                        score += 10
-                    if token in item.description.lower():
-                        score += 4
-                    if any(token in cap.lower() for cap in item.capabilities):
-                        score += 8
-
-                if score > 0:
-                    scored_results.append((score, item))
-
-            scored_results.sort(key=lambda x: x[0], reverse=True)
-            results = [item for _, item in scored_results]
-
-        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-
-        return SearchResponse(
-            query=query,
-            type_filter=type_filter.value if type_filter else None,
-            total_results=len(results),
-            execution_time_ms=round(elapsed_ms, 3),
-            results=results,
-        )
-
-    def _seed_default_catalog(self):
-        seed_items = [
-            ResourceRegistration(
-                id="agent-tokyo-warehouse",
-                type=ResourceType.AGENT,
-                name="Tokyo Logistics Hub Agent",
-                description="Autonomous regional inventory controller for Asia-Pacific operations. Supports A2A protocol and local MCP data warehouse queries.",
-                endpoint="http://localhost:8001/a2a",
-                version="1.2.0",
-                tags=["warehouse", "inventory", "apac", "tokyo", "supply-chain", "logistics"],
-                capabilities=["inventory_query", "stock_allocation", "customs_manifest"],
-                provider="Global Logistics Corp APAC",
-                location="Tokyo, Japan",
-                schema_url="http://localhost:8001/.well-known/agent.json",
-                metadata={"currency": "JPY", "timezone": "Asia/Tokyo", "region": "APAC"},
-            ),
-            ResourceRegistration(
-                id="agent-london-warehouse",
-                type=ResourceType.AGENT,
-                name="London Heathrow Distribution Hub Agent",
-                description="Autonomous inventory gateway for EMEA territories. Manages cross-docking, bonded storage, and automated reorder triggers.",
-                endpoint="http://localhost:8002/a2a",
-                version="1.1.4",
-                tags=["warehouse", "inventory", "emea", "london", "uk", "logistics"],
-                capabilities=["inventory_query", "reorder_trigger", "bonded_audit"],
-                provider="Global Logistics Corp EMEA",
-                location="London, United Kingdom",
-                schema_url="http://localhost:8002/.well-known/agent.json",
-                metadata={"currency": "GBP", "timezone": "Europe/London", "region": "EMEA"},
-            ),
-            ResourceRegistration(
-                id="agent-newyork-warehouse",
-                type=ResourceType.AGENT,
-                name="New York JFK Gateway Hub Agent",
-                description="Americas East primary fulfillment node. Synchronizes cold storage, high-velocity electronics, and ground freight manifests.",
-                endpoint="http://localhost:8003/a2a",
-                version="2.0.1",
-                tags=["warehouse", "inventory", "americas", "new-york", "usa", "logistics"],
-                capabilities=["inventory_query", "express_shipping", "carrier_dispatch"],
-                provider="Global Logistics Corp Americas",
-                location="New York, USA",
-                schema_url="http://localhost:8003/.well-known/agent.json",
-                metadata={"currency": "USD", "timezone": "America/New_York", "region": "Americas"},
-            ),
-            ResourceRegistration(
-                id="agent-warsaw-warehouse",
-                type=ResourceType.AGENT,
-                name="Warsaw Central Distribution Node Agent",
-                description="Central & Eastern Europe intermodal freight hub. Connects rail corridors and pan-European distribution networks.",
-                endpoint="http://localhost:8004/a2a",
-                version="1.0.8",
-                tags=["warehouse", "inventory", "europe", "warsaw", "poland", "logistics"],
-                capabilities=["inventory_query", "intermodal_routing", "pallet_tracking"],
-                provider="Global Logistics Corp CEE",
-                location="Warsaw, Poland",
-                schema_url="http://localhost:8004/.well-known/agent.json",
-                metadata={"currency": "EUR", "timezone": "Europe/Warsaw", "region": "CEE"},
-            ),
-            ResourceRegistration(
-                id="agent-delhi-warehouse",
-                type=ResourceType.AGENT,
-                name="Delhi NCR Cargo Hub Agent",
-                description="South Asia high-volume manufacturing and fulfillment node. Manages high-throughput inventory and local distribution.",
-                endpoint="http://localhost:8005/a2a",
-                version="1.3.0",
-                tags=["warehouse", "inventory", "south-asia", "delhi", "india", "logistics"],
-                capabilities=["inventory_query", "bulk_dispatch", "gst_audit"],
-                provider="Global Logistics Corp South Asia",
-                location="Delhi, India",
-                schema_url="http://localhost:8005/.well-known/agent.json",
-                metadata={"currency": "INR", "timezone": "Asia/Kolkata", "region": "South Asia"},
-            ),
-            ResourceRegistration(
-                id="mcp-sqlite-warehouse-tokyo",
-                type=ResourceType.MCP,
-                name="Tokyo Warehouse Read-Only MCP Server",
-                description="Direct database driver exposing 6 warehouse tables (inventory, products, aisles, stock_movements) over Model Context Protocol.",
-                endpoint="http://localhost:8001/mcp",
-                version="0.9.5",
-                tags=["mcp", "database", "sqlite", "read-only", "tokyo"],
-                capabilities=["schema_discovery", "execute_readonly_sql", "stock_lookup"],
-                provider="Logistics Data Platform",
-                location="Tokyo, Japan",
-                schema_url="http://localhost:8001/mcp/schema",
-            ),
-            ResourceRegistration(
-                id="skill-inventory-audit",
-                type=ResourceType.SKILL,
-                name="Global Inventory Audit & Reconciliation Skill",
-                description="Reusable multi-agent procedure for federated variance reconciliation across asynchronous warehouse nodes.",
-                endpoint="https://github.com/ards-project/skills/inventory-audit",
-                version="1.0.0",
-                tags=["skill", "audit", "reconciliation", "finance"],
-                capabilities=["variance_detection", "executive_reporting"],
-            ),
-        ]
-        for item in seed_items:
-            self.register(item)
+    def close(self) -> None:
+        self.backend.close()
 
 
-registry = Registry()
+class _DefaultRegistry:
+    """Lazy proxy for the process-wide default `Registry`.
+
+    The real Registry (and its SQLite file) is only created on first use, so `import ards`
+    has no side effects for users who only need `ARDSClient`. Call `configure()` to replace it.
+    """
+
+    def __init__(self) -> None:
+        self._instance: Optional[Registry] = None
+        self._lock = threading.Lock()
+
+    def get_instance(self) -> Registry:
+        if self._instance is None:
+            with self._lock:
+                if self._instance is None:
+                    self._instance = Registry()
+        return self._instance
+
+    def configure(self, **kwargs: Any) -> Registry:
+        """Replace the default registry, e.g. `default_registry.configure(backend=SQLiteBackend(':memory:'))`.
+
+        Note: subscriptions made on the previous instance are not carried over.
+        """
+        with self._lock:
+            if self._instance is not None:
+                self._instance.close()
+            self._instance = Registry(**kwargs)
+        return self._instance
+
+    def reset(self) -> None:
+        """Drop the current instance; the next use rebuilds it from the (possibly reloaded) settings."""
+        with self._lock:
+            if self._instance is not None:
+                self._instance.close()
+            self._instance = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.get_instance(), name)
+
+
+# Deprecated in-memory dictionary implementation (replaced by pluggable StorageBackend & SQLite FTS5):
+# class Registry:
+#     def __init__(self):
+#         self._resources: Dict[str, ResourceRegistration] = {}
+#         self._seed_default_catalog()
+
+default_registry = _DefaultRegistry()
+# Backward-compatible alias used by `from ards.registry import registry`.
+registry = default_registry

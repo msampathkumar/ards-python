@@ -5,4 +5,7 @@ __pycache__/
 dist/
 build/
 *.db
+*.db-wal
+*.db-shm
+.env
 .pytest_cache/
