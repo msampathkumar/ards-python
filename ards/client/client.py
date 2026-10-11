@@ -22,11 +22,13 @@ class ARDSClient:
         timeout: float = 10.0,
         max_connections: int = 200,
         max_keepalive_connections: int = 50,
+        retries: int = 2,
     ):
         default_url = f"http://{settings.host}:{settings.port}"
         self.base_url = (base_url or default_url).rstrip("/")
         self.cache_ttl = cache_ttl
         self.timeout = timeout
+        self.retries = retries
         self._limits = httpx.Limits(
             max_connections=max_connections,
             max_keepalive_connections=max_keepalive_connections,
@@ -40,6 +42,8 @@ class ARDSClient:
                 base_url=self.base_url,
                 timeout=self.timeout,
                 limits=self._limits,
+                # Retries only connection-level failures (safe for all methods); HTTP errors are not retried.
+                transport=httpx.AsyncHTTPTransport(retries=self.retries, limits=self._limits),
             )
         return self._client
 

@@ -43,5 +43,8 @@ ards = "ards.cli:main"
 where = ["."]
 include = ["ards*", "demos*"]
 
+[tool.setuptools.package-data]
+ards = ["py.typed"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]

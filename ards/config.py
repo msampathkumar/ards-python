@@ -1,7 +1,7 @@
 """ARDS Configuration Loader (.env and Environment Variable Support)."""
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Optional
 
@@ -83,6 +83,13 @@ class ARDSConfig:
     vertex_search_datastore_id: Optional[str] = None
     vertex_search_location: str = "global"
 
+    # Security
+    # admin_token: when set, admin actions (DELETE, ops sweep, endpoint takeover) need
+    # `Authorization: Bearer <token>`. When unset, admin actions are allowed only from loopback clients.
+    admin_token: Optional[str] = None
+    # allow_local_endpoints: accept localhost/private-IP endpoints (handy for local dev; set false when hosted).
+    allow_local_endpoints: bool = True
+
     @classmethod
     def from_env(cls, env_file: Optional[str] = None, override_env: bool = False) -> "ARDSConfig":
         load_dotenv(env_file, override=override_env)
@@ -127,7 +134,21 @@ class ARDSConfig:
             bq_cache_ttl_seconds=float(os.environ.get("ARDS_BQ_CACHE_TTL_SECONDS", "30")),
             vertex_search_datastore_id=vertex_ds,
             vertex_search_location=os.environ.get("VERTEX_SEARCH_LOCATION", "global"),
+            admin_token=os.environ.get("ARDS_ADMIN_TOKEN", "").strip() or None,
+            allow_local_endpoints=_parse_bool(os.environ.get("ARDS_ALLOW_LOCAL_ENDPOINTS"), default=True),
         )
 
 
 settings = ARDSConfig.from_env()
+
+
+def reload_settings(env_file: Optional[str] = None, override_env: bool = False) -> ARDSConfig:
+    """Re-read .env / environment and update the shared `settings` object in place.
+
+    Modules hold a reference to the same `settings` object, so in-place updates reach all of them.
+    The CLI calls this after applying flags like `--backend` and `--auto-clean`.
+    """
+    fresh = ARDSConfig.from_env(env_file, override_env=override_env)
+    for f in fields(fresh):
+        setattr(settings, f.name, getattr(fresh, f.name))
+    return settings

@@ -9,19 +9,35 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from contextlib import asynccontextmanager
+from fastapi import Depends
 from ards.config import settings
 from ards.models import ResourceRegistration, ResourceType, SearchResponse
-from ards.ops import ARDSOpsBrain
 from ards.registry import registry
 
 from ards.server.interfaces import router as interfaces_router
-from ards.server.verifier import verifier
+from ards.server.security import (
+    BASE_SECURITY_HEADERS,
+    HTML_CSP,
+    require_admin,
+    takeover_error,
+)
+from ards.server.state import ops_brain
+from ards.server.verifier import is_safe_http_url, verifier
 from ards.plugins.base import plugin_manager
 from ards.plugins.gcp_plugins import BigQueryRegistryAuditPlugin, VertexAISearchPlugin
 
 from ards.server.registration_ui import register_router
 
-ops_brain = ARDSOpsBrain(registry=registry, verifier=verifier, config=settings)
+# Deprecated: ops_brain now lives in ards.server.state so the HTML form and the API share it.
+# ops_brain = ARDSOpsBrain(registry=registry, verifier=verifier, config=settings)
+
+MAX_PAGE_SIZE = 200
+
+
+def _parse_type(type_value: Optional[str]) -> Optional[ResourceType]:
+    if type_value and type_value.lower() in ("agent", "skill", "plugin", "mcp"):
+        return ResourceType(type_value.lower())
+    return None
 
 
 @asynccontextmanager
@@ -117,10 +133,10 @@ GOOGLE_SEARCH_HTML = """<!DOCTYPE html>
 
       <!-- Filter Chips -->
       <div class="flex flex-wrap items-center justify-center gap-2 mt-4">
-        <a href="/?q={{ query }}" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if not type_filter %}bg-gray-900 text-white border-gray-900{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">All Types</a>
-        <a href="/?q={{ query }}&type=agent" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if type_filter == 'agent' %}bg-blue-600 text-white border-blue-600{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">🤖 Agents</a>
-        <a href="/?q={{ query }}&type=mcp" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if type_filter == 'mcp' %}bg-purple-600 text-white border-purple-600{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">🔌 MCP Servers</a>
-        <a href="/?q={{ query }}&type=skill" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if type_filter == 'skill' %}bg-emerald-600 text-white border-emerald-600{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">⚡ Skills</a>
+        <a href="/?q={{ query | urlencode }}" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if not type_filter %}bg-gray-900 text-white border-gray-900{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">All Types</a>
+        <a href="/?q={{ query | urlencode }}&type=agent" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if type_filter == 'agent' %}bg-blue-600 text-white border-blue-600{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">🤖 Agents</a>
+        <a href="/?q={{ query | urlencode }}&type=mcp" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if type_filter == 'mcp' %}bg-purple-600 text-white border-purple-600{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">🔌 MCP Servers</a>
+        <a href="/?q={{ query | urlencode }}&type=skill" class="px-3.5 py-1 rounded-full text-xs font-medium border {% if type_filter == 'skill' %}bg-emerald-600 text-white border-emerald-600{% else %}bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100{% endif %}">⚡ Skills</a>
       </div>
     </form>
 
@@ -154,7 +170,7 @@ GOOGLE_SEARCH_HTML = """<!DOCTYPE html>
         </div>
 
         <h3 class="text-lg font-medium text-blue-700 hover:underline cursor-pointer">
-          <a href="{{ item.endpoint }}" target="_blank">{{ item.name }}</a>
+          {% if item.endpoint is safe_url %}<a href="{{ item.endpoint }}" target="_blank" rel="noopener noreferrer">{{ item.name }}</a>{% else %}{{ item.name }}{% endif %}
         </h3>
 
         <p class="text-xs font-mono text-emerald-700 truncate mb-2">{{ item.endpoint }}</p>
@@ -200,17 +216,34 @@ GOOGLE_SEARCH_HTML = """<!DOCTYPE html>
 from jinja2 import Environment
 
 _jinja_env = Environment(autoescape=True)
+# Jinja test used by the template: only http(s) endpoints become clickable links (blocks javascript: XSS).
+_jinja_env.tests["safe_url"] = is_safe_http_url
 _search_template = _jinja_env.from_string(GOOGLE_SEARCH_HTML)
 
 
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request, q: str = "", type: Optional[str] = None):
-    """Google-search styled discovery home page."""
-    type_filter = None
-    if type and type.lower() in ("agent", "skill", "plugin", "mcp"):
-        type_filter = ResourceType(type.lower())
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for header, value in BASE_SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    # Strict CSP only on our own HTML pages (Swagger at /docs needs its own CDN assets).
+    if request.url.path in ("/", "/register"):
+        response.headers["Content-Security-Policy"] = HTML_CSP
+    return response
 
-    resp = registry.search(query=q, type_filter=type_filter)
+
+@app.get("/healthz")
+async def healthz():
+    """Liveness/readiness probe for Cloud Run, Kubernetes, and load balancers."""
+    return {"status": "ok", "backend": registry.backend.backend_name}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request, q: str = Query("", max_length=256), type: Optional[str] = None):
+    """Google-search styled discovery home page."""
+    type_filter = _parse_type(type)
+
+    resp = registry.search(query=q, type_filter=type_filter, limit=50)
     resp = await plugin_manager.trigger_on_search(q, resp)
 
     # Deprecated manual string replacement (left raw {% if %}, {% for %}, {% endfor %} tags in HTML):
@@ -229,30 +262,38 @@ async def home(request: Request, q: str = "", type: Optional[str] = None):
 
 # REST API Endpoints
 @app.get("/api/v1/search", response_model=SearchResponse)
-async def api_search(q: str = "", type: Optional[str] = None):
-    type_filter = None
-    if type and type.lower() in ("agent", "skill", "plugin", "mcp"):
-        type_filter = ResourceType(type.lower())
-    resp = registry.search(query=q, type_filter=type_filter)
+async def api_search(
+    q: str = Query("", max_length=256),
+    type: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+):
+    resp = registry.search(query=q, type_filter=_parse_type(type), limit=limit)
     return await plugin_manager.trigger_on_search(q, resp)
 
 
 @app.get("/api/v1/resources")
-async def api_list_resources(type: Optional[str] = None):
-    type_filter = None
-    if type and type.lower() in ("agent", "skill", "plugin", "mcp"):
-        type_filter = ResourceType(type.lower())
-    return registry.list_all(type_filter=type_filter)
+async def api_list_resources(
+    type: Optional[str] = None,
+    limit: int = Query(MAX_PAGE_SIZE, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    items = registry.list_all(type_filter=_parse_type(type))
+    return items[offset : offset + limit]
 
 
 @app.post("/api/v1/resources", response_model=ResourceRegistration)
-async def api_register_resource(res: ResourceRegistration):
-    # Verify URL syntax & SSRF policy immediately
-    verified, msg = await verifier.verify(res)
-    if not verified:
+async def api_register_resource(res: ResourceRegistration, request: Request):
+    # Cheap URL/SSRF policy check up front; live probing happens in the Ops Brain (non-blocking).
+    # Deprecated: `await verifier.verify(res)` probed endpoints inline (up to 4s per request).
+    ok, msg = await verifier.check_url_policy(res, allow_local=settings.allow_local_endpoints)
+    if not ok:
         raise HTTPException(status_code=400, detail=msg)
 
-    # Route through Ops Brain (inline by default; or Pub/Sub queue if ARDS_PUBSUB_ENABLED=true)
+    conflict = takeover_error(registry.get(res.id), res, request)
+    if conflict:
+        raise HTTPException(status_code=409, detail=conflict)
+
+    # Route through Ops Brain (background verification by default; Pub/Sub queue if ARDS_PUBSUB_ENABLED=true)
     registered = await ops_brain.submit_for_verification(res)
     # Trigger post-registration hooks (e.g., BigQuery audit stream)
     await plugin_manager.trigger_post_registration(registered)
@@ -267,7 +308,7 @@ async def api_get_resource(res_id: str):
     return res
 
 
-@app.delete("/api/v1/resources/{res_id}")
+@app.delete("/api/v1/resources/{res_id}", dependencies=[Depends(require_admin)])
 async def api_delete_resource(res_id: str):
     deleted = registry.delete(res_id)
     if not deleted:
@@ -289,13 +330,8 @@ async def api_ops_status():
     }
 
 
-@app.post("/api/v1/ops/sweep")
+@app.post("/api/v1/ops/sweep", dependencies=[Depends(require_admin)])
 async def api_ops_sweep(auto_clean: Optional[bool] = None):
-    """Triggers an immediate validation & health sweep by the Ops Brain."""
-    prev = ops_brain.auto_clean
-    if auto_clean is not None:
-        ops_brain.auto_clean = auto_clean
-    try:
-        return await ops_brain.sweep_once()
-    finally:
-        ops_brain.auto_clean = prev
+    """Triggers an immediate validation & health sweep by the Ops Brain (admin only)."""
+    # Deprecated: temporarily flipped ops_brain.auto_clean, which raced with the background sweep loop.
+    return await ops_brain.sweep_once(auto_clean=auto_clean)

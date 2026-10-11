@@ -11,13 +11,12 @@
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
 
 from ards.config import ARDSConfig, settings
 from ards.events import EventBus
 from ards.models import ResourceRegistration, ResourceType
-from ards.registry import Registry
 from ards.server.verifier import RegistrationVerifier, verifier as default_verifier
 
 logger = logging.getLogger("ards.ops")
@@ -27,21 +26,23 @@ class ARDSOpsBrain:
     """
     Autonomous Operations Engine ("Brain of Ops") for ARDS.
     Responsibilities:
-    1. Verify submitted registrations (inline or consumed via Pub/Sub queue).
+    1. Verify submitted registrations (in the background, or consumed via Pub/Sub queue).
     2. Periodically sweep and validate live endpoints in the registry.
     3. Evict non-working resources when `auto_clean=True` (`--auto-clean`).
     """
 
     def __init__(
         self,
-        registry: Registry,
+        registry: Any,
         verifier: Optional[RegistrationVerifier] = None,
         event_bus: Optional[EventBus] = None,
         auto_clean: Optional[bool] = None,
         sweep_interval_seconds: Optional[float] = None,
         max_failures: Optional[int] = None,
         protect_seed_data: Optional[bool] = None,
-        allow_local: bool = True,
+        allow_local: Optional[bool] = None,
+        probe_timeout_seconds: float = 3.0,
+        max_concurrent_probes: int = 20,
         config: Optional[ARDSConfig] = None,
     ):
         self.config = config or settings
@@ -58,15 +59,20 @@ class ARDSOpsBrain:
         self.protect_seed_data = (
             protect_seed_data if protect_seed_data is not None else self.config.protect_seed_data
         )
-        self.allow_local = allow_local
+        self.allow_local = allow_local if allow_local is not None else self.config.allow_local_endpoints
+        self.probe_timeout_seconds = probe_timeout_seconds
+        self.max_concurrent_probes = max_concurrent_probes
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._sweep_lock = asyncio.Lock()
+        self._verification_tasks: Set[asyncio.Task] = set()
         self.stats: Dict[str, Any] = {
             "sweeps_completed": 0,
             "resources_verified": 0,
             "resources_evicted": 0,
             "last_sweep_at": None,
+            "last_sweep_duration_ms": None,
         }
 
         # Subscribe to async registration submissions from Pub/Sub bus
@@ -81,43 +87,35 @@ class ARDSOpsBrain:
 
     async def submit_for_verification(self, res: ResourceRegistration) -> ResourceRegistration:
         """
-        Used by the Frontend server on registration intake:
-        - If Pub/Sub is disabled (default simple mode), verifies and registers immediately inline.
-        - If Pub/Sub is enabled, records with `provisional` status and publishes `resource.submitted`
-          for the Ops Brain worker to verify asynchronously.
+        Used by the Frontend server on registration intake. Never blocks the caller on network probes:
+        - Default simple mode: saves as `provisional` and verifies in a background task in this process.
+        - Pub/Sub mode: saves as `provisional` and publishes `resource.submitted` for the Ops Brain worker.
         """
-        if not self.config.pubsub_enabled or self.event_bus.provider_name == "memory":
-            return await self.verify_and_record(res)
-
         res.health_status = "provisional"
+        if not self.config.pubsub_enabled or self.event_bus.provider_name == "memory":
+            res.verification_message = "Queued for background verification."
+            saved = self.registry.register(res)
+            self._schedule(self.verify_and_record(saved.model_copy()))
+            return saved
+
         res.verification_message = "Queued for Ops Brain verification via Pub/Sub."
         saved = self.registry.register(res)
         await self.event_bus.publish("resource.submitted", saved.model_dump())
         return saved
 
-    async def verify_and_record(self, res: ResourceRegistration) -> ResourceRegistration:
-        """Validates a resource via RegistrationVerifier and updates its status in the registry."""
-        ok, msg = await self.verifier.verify(res, allow_local=self.allow_local)
-        now = time.time()
-        res.last_verified_at = now
-        res.verification_message = msg
+    def _schedule(self, coro: Any) -> None:
+        try:
+            task = asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            asyncio.run(coro)
+            return
+        self._verification_tasks.add(task)
+        task.add_done_callback(self._verification_tasks.discard)
 
-        if not ok:
-            res.consecutive_failures += 1
-            res.health_status = "unreachable"
-            if self.auto_clean and res.consecutive_failures >= self.max_failures:
-                self.registry.delete(res.id)
-                self.stats["resources_evicted"] += 1
-                await self.event_bus.publish("resource.evicted", {"id": res.id, "reason": msg})
-                return res
-        else:
-            res.consecutive_failures = 0
-            res.health_status = "healthy" if msg.startswith("VERIFIED:") else "provisional"
-
-        saved = self.registry.register(res)
-        self.stats["resources_verified"] += 1
-        await self.event_bus.publish("resource.verified", saved.model_dump())
-        return saved
+    async def wait_for_pending_verifications(self) -> None:
+        """Waits for background verification tasks (useful in tests and graceful shutdown)."""
+        if self._verification_tasks:
+            await asyncio.gather(*list(self._verification_tasks), return_exceptions=True)
 
     async def probe_endpoint_live(self, res: ResourceRegistration) -> bool:
         """Actively checks whether a registered resource endpoint is reachable and healthy."""
@@ -129,74 +127,117 @@ class ARDSOpsBrain:
             probe_url = res.schema_url
 
         try:
-            async with httpx.AsyncClient(timeout=2.5) as client:
+            async with httpx.AsyncClient(timeout=self.probe_timeout_seconds) as client:
                 resp = await client.get(probe_url)
                 return resp.status_code < 500
         except Exception:
             return False
 
-    async def sweep_once(self) -> Dict[str, Any]:
+    async def evaluate(self, res: ResourceRegistration) -> Tuple[bool, str]:
+        """One health check = URL/SSRF policy check + a single live probe.
+
+        Previously sweeps called the full verifier (which probes) AND probe_endpoint_live,
+        doubling network calls per resource.
+        """
+        ok, msg = await self.verifier.check_url_policy(res, allow_local=self.allow_local)
+        if not ok:
+            return False, msg
+        if await self.probe_endpoint_live(res):
+            return True, "VERIFIED: Active endpoint check passed."
+        return False, "UNREACHABLE: Endpoint did not respond (or returned 5xx)."
+
+    async def _apply_result(
+        self, item: ResourceRegistration, ok: bool, msg: str, auto_clean: Optional[bool] = None
+    ) -> Optional[str]:
+        """Updates health fields and evicts when needed. Returns the evicted id, if any."""
+        clean = self.auto_clean if auto_clean is None else auto_clean
+        item.last_verified_at = time.time()
+        if ok:
+            item.consecutive_failures = 0
+            item.health_status = "healthy"
+            item.verification_message = msg
+            self.registry.register(item)
+            return None
+
+        item.consecutive_failures += 1
+        item.health_status = "unreachable" if item.consecutive_failures >= self.max_failures else "degraded"
+        item.verification_message = f"FAILED_CHECK ({item.consecutive_failures}/{self.max_failures}): {msg}"
+        if clean and item.consecutive_failures >= self.max_failures:
+            self.registry.delete(item.id)
+            self.stats["resources_evicted"] += 1
+            await self.event_bus.publish(
+                "resource.evicted",
+                {"id": item.id, "consecutive_failures": item.consecutive_failures, "reason": msg},
+            )
+            return item.id
+        self.registry.register(item)
+        return None
+
+    async def verify_and_record(self, res: ResourceRegistration) -> ResourceRegistration:
+        """Validates a resource and updates its status in the registry."""
+        ok, msg = await self.evaluate(res)
+        await self._apply_result(res, ok, msg)
+        self.stats["resources_verified"] += 1
+        await self.event_bus.publish("resource.verified", res.model_dump())
+        return res
+
+    async def sweep_once(self, auto_clean: Optional[bool] = None) -> Dict[str, Any]:
         """
         Runs a full validation pass over all registered resources (plus drains any pending Pub/Sub events).
         When `auto_clean=True` (`--auto-clean`), evicts resources that exceed `max_failures`.
+        Sweeps never overlap: a manual `/api/v1/ops/sweep` waits for a running background sweep.
+        `auto_clean` overrides the instance setting for this sweep only.
         """
-        await self.event_bus.poll_once()
-        items = self.registry.list_all()
-        sem = asyncio.Semaphore(10)
+        clean = self.auto_clean if auto_clean is None else auto_clean
+        async with self._sweep_lock:
+            started = time.perf_counter()
+            sweep_started_at = time.time()
+            await self.event_bus.poll_once()
+            items = self.registry.list_all()
+            sem = asyncio.Semaphore(self.max_concurrent_probes)
 
-        checked = 0
-        healthy_count = 0
-        degraded_count = 0
-        evicted_ids: List[str] = []
+            checked = 0
+            healthy_count = 0
+            degraded_count = 0
+            evicted_ids: List[str] = []
 
-        async def _check_item(item: ResourceRegistration) -> None:
-            nonlocal checked, healthy_count, degraded_count
-            if self.protect_seed_data and item.metadata.get("seed") is True:
-                healthy_count += 1
-                return
-
-            async with sem:
-                checked += 1
-                ok, msg = await self.verifier.verify(item, allow_local=self.allow_local)
-                reachable = ok and await self.probe_endpoint_live(item)
-                now = time.time()
-                item.last_verified_at = now
-
-                if reachable:
-                    item.consecutive_failures = 0
-                    item.health_status = "healthy"
-                    item.verification_message = "VERIFIED: Active endpoint check passed."
-                    self.registry.register(item)
+            async def _check_item(item: ResourceRegistration) -> None:
+                nonlocal checked, healthy_count, degraded_count
+                if self.protect_seed_data and item.metadata.get("seed") is True:
                     healthy_count += 1
-                else:
-                    item.consecutive_failures += 1
-                    item.health_status = (
-                        "unreachable" if item.consecutive_failures >= self.max_failures else "degraded"
-                    )
-                    item.verification_message = f"FAILED_PROBE ({item.consecutive_failures}/{self.max_failures}): {msg}"
-                    if self.auto_clean and item.consecutive_failures >= self.max_failures:
-                        self.registry.delete(item.id)
-                        evicted_ids.append(item.id)
-                        self.stats["resources_evicted"] += 1
-                        await self.event_bus.publish(
-                            "resource.evicted",
-                            {"id": item.id, "consecutive_failures": item.consecutive_failures},
-                        )
+                    return
+                # Already checked moments ago while draining queued submissions above:
+                # don't count a second failure for the same resource in one sweep.
+                if item.last_verified_at is not None and item.last_verified_at >= sweep_started_at:
+                    if item.health_status == "healthy":
+                        healthy_count += 1
                     else:
-                        self.registry.register(item)
+                        degraded_count += 1
+                    return
+
+                async with sem:
+                    checked += 1
+                    ok, msg = await self.evaluate(item)
+                    evicted = await self._apply_result(item, ok, msg, auto_clean=clean)
+                    if ok:
+                        healthy_count += 1
+                    elif evicted:
+                        evicted_ids.append(evicted)
+                    else:
                         degraded_count += 1
 
-        await asyncio.gather(*(_check_item(i) for i in items))
+            await asyncio.gather(*(_check_item(i) for i in items))
 
-        self.stats["sweeps_completed"] += 1
-        self.stats["last_sweep_at"] = time.time()
-        return {
-            "checked": checked,
-            "healthy": healthy_count,
-            "degraded_or_unreachable": degraded_count,
-            "evicted": evicted_ids,
-            "auto_clean": self.auto_clean,
-        }
+            self.stats["sweeps_completed"] += 1
+            self.stats["last_sweep_at"] = time.time()
+            self.stats["last_sweep_duration_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+            return {
+                "checked": checked,
+                "healthy": healthy_count,
+                "degraded_or_unreachable": degraded_count,
+                "evicted": evicted_ids,
+                "auto_clean": clean,
+            }
 
     async def run_forever(self) -> None:
         """Background loop for the Ops Brain (runs embedded in combined mode or standalone in worker mode)."""
@@ -205,7 +246,7 @@ class ARDSOpsBrain:
             try:
                 await self.sweep_once()
             except Exception as exc:
-                logger.debug("OpsBrain sweep error: %s", exc)
+                logger.warning("OpsBrain sweep error: %s", exc)
             await asyncio.sleep(self.sweep_interval_seconds)
 
     def start_background(self) -> Optional[asyncio.Task]:
@@ -223,3 +264,5 @@ class ARDSOpsBrain:
             except asyncio.CancelledError:
                 pass
         self._task = None
+        for task in list(self._verification_tasks):
+            task.cancel()

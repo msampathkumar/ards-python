@@ -14,7 +14,8 @@ import asyncio
 import os
 import uvicorn
 
-from ards.config import ARDSConfig, load_dotenv
+from ards.config import load_dotenv, reload_settings
+from ards.registry import default_registry
 
 
 def main() -> None:
@@ -82,13 +83,15 @@ def main() -> None:
     if getattr(args, "interval", None) is not None:
         os.environ["ARDS_SWEEP_INTERVAL_SECONDS"] = str(args.interval)
 
-    cfg = ARDSConfig.from_env(args.env_file, override_env=False)
+    cfg = reload_settings(args.env_file, override_env=False)
+    # The default registry may already exist (importing `ards` happens before argument parsing);
+    # drop it so it is rebuilt from the reloaded settings on first use.
+    default_registry.reset()
 
     if args.command == "ops-worker":
         from ards.ops import ARDSOpsBrain
-        from ards.registry import Registry
 
-        reg = Registry(config=cfg)
+        reg = default_registry.get_instance()
         brain = ARDSOpsBrain(registry=reg, auto_clean=cfg.auto_clean, config=cfg)
         if args.once:
             summary = asyncio.run(brain.sweep_once())
@@ -102,9 +105,12 @@ def main() -> None:
         return
 
     # Default to `serve`
+    from ards.server.security import warn_if_exposed_without_token
+
     host = getattr(args, "host", None) or cfg.host
     port = getattr(args, "port", None) or cfg.port
     reload_flag = getattr(args, "reload", False) or cfg.reload
+    warn_if_exposed_without_token(host)
     uvicorn.run("ards.server.app:app", host=host, port=port, reload=reload_flag)
 
 

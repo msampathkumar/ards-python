@@ -1,10 +1,15 @@
 """Interactive Human & Agent Self-Registration Modal and Route."""
 
+from urllib.parse import quote_plus
+
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import ValidationError
 
+from ards.config import settings
 from ards.models import ResourceRegistration, ResourceType
 from ards.registry import registry
+from ards.server.security import takeover_error
 from ards.server.verifier import verifier
 from ards.plugins.base import plugin_manager
 
@@ -134,26 +139,36 @@ async def submit_registration(
     caps = [c.strip() for c in capabilities.split(",") if c.strip()]
     tgs = [t.strip() for t in tags.split(",") if t.strip()]
 
-    item = ResourceRegistration(
-        id=id.strip(),
-        type=ResourceType(type),
-        name=name.strip(),
-        endpoint=endpoint.strip(),
-        description=description.strip(),
-        location=location.strip() or None,
-        capabilities=caps,
-        tags=tgs,
-    )
+    try:
+        item = ResourceRegistration(
+            id=id.strip(),
+            type=ResourceType(type),
+            name=name.strip(),
+            endpoint=endpoint.strip(),
+            description=description.strip(),
+            location=location.strip() or None,
+            capabilities=caps,
+            tags=tgs,
+        )
+    except (ValueError, ValidationError) as exc:
+        # Previously an invalid type or field raised an unhandled error (HTTP 500).
+        first = exc.errors()[0]["msg"] if isinstance(exc, ValidationError) else str(exc)
+        html = _register_template.render(message=f"Invalid submission: {first}", success=False)
+        return HTMLResponse(html, status_code=422)
 
-    verified, msg = await verifier.verify(item)
-    if not verified:
+    # Deprecated: full `verifier.verify(item)` probed inline and the form skipped the Ops Brain path.
+    ok, msg = await verifier.check_url_policy(item, allow_local=settings.allow_local_endpoints)
+    conflict = None if not ok else takeover_error(registry.get(item.id), item, request)
+    if not ok or conflict:
         # Deprecated manual string replacement:
         # html = REGISTRATION_PAGE_HTML.replace("{{ message }}", f"Verification Failed: {msg}")
         # html = html.replace("{% if success %}", "").replace("{% else %}", "").replace("{% endif %}", "")
-        html = _register_template.render(message=f"Verification Failed: {msg}", success=False)
-        return HTMLResponse(html)
+        html = _register_template.render(message=f"Verification Failed: {conflict or msg}", success=False)
+        return HTMLResponse(html, status_code=409 if conflict else 400)
 
-    registered = registry.register(item)
+    from ards.server.state import ops_brain  # Local import avoids a circular import at module load.
+
+    registered = await ops_brain.submit_for_verification(item)
     await plugin_manager.trigger_post_registration(registered)
 
-    return RedirectResponse(url=f"/?q={registered.name}", status_code=303)
+    return RedirectResponse(url=f"/?q={quote_plus(registered.name)}", status_code=303)

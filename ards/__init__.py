@@ -1,9 +1,16 @@
 """ARDS Python SDK: Agent & Resource Directory Service."""
 
+try:
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    __version__ = _pkg_version("ards-python")
+except Exception:  # pragma: no cover - not installed (e.g. running from a source checkout)
+    __version__ = "0.0.0+local"
+
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from ards.client.client import ARDSClient
-from ards.config import ARDSConfig, load_dotenv, settings
+from ards.config import ARDSConfig, load_dotenv, reload_settings, settings
 from ards.events import (
     EventBus,
     GCPPubSubEventBus,
@@ -13,7 +20,8 @@ from ards.events import (
 )
 from ards.models import AgentCard, ResourceRegistration, ResourceType, SearchResponse
 from ards.ops import ARDSOpsBrain
-from ards.registry import Registry, registry
+# Deprecated: `from ards.registry import Registry, registry` shadowed the `ards.registry` submodule.
+from ards.registry import Registry, default_registry, make_resource_id
 from ards.storage import (
     BigQueryBackend,
     HybridBackend,
@@ -62,7 +70,7 @@ async def submit(
                 schema_url=schema_url,
                 metadata=metadata,
             )
-    return registry.submit(
+    return default_registry.submit(
         name=name,
         endpoint=endpoint,
         type=type,
@@ -100,7 +108,7 @@ def register_agent(
         class OsakaAgent:
             ...
     """
-    reg = target_registry or registry
+    reg = target_registry or default_registry
 
     def decorator(obj: T) -> T:
         doc = description or (getattr(obj, "__doc__", None) or "").strip()
@@ -124,8 +132,13 @@ def register_agent(
 
 
 def on_registration(func: Callable[[ResourceRegistration], Any]) -> Callable[[ResourceRegistration], Any]:
-    """Top-level decorator to subscribe to new registrations on the default `registry`."""
-    return registry.on_registration(func)
+    """Top-level decorator to subscribe to new registrations on the default registry."""
+    return default_registry.on_registration(func)
+
+
+def on_update(func: Callable[[ResourceRegistration], Any]) -> Callable[[ResourceRegistration], Any]:
+    """Top-level decorator to subscribe to updates (e.g. health changes) on the default registry."""
+    return default_registry.on_update(func)
 
 
 __all__ = [
@@ -151,7 +164,11 @@ __all__ = [
     "load_dotenv",
     "on_registration",
     "register_agent",
-    "registry",
+    "default_registry",
+    "make_resource_id",
+    "on_update",
+    "reload_settings",
+    "__version__",
     "settings",
     "submit",
 ]

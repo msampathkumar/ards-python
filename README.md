@@ -77,10 +77,15 @@ import ards
 class OsakaAgent:
     """Autonomous warehouse controller for Osaka."""
 
-# Subscribe to new registrations
+# Subscribe to new registrations (fires once per new resource)
 @ards.on_registration
 async def on_new_resource(res: ards.ResourceRegistration):
     print(f"[Subscribed] Registered {res.name} ({res.id}) -> {res.health_status}")
+
+# Subscribe to changes of existing resources (e.g. health status set by the Ops Brain)
+@ards.on_update
+async def on_changed(res: ards.ResourceRegistration):
+    print(f"[Update] {res.id} is now {res.health_status}")
 
 async def main():
     # 1-line submission for humans or agents
@@ -122,6 +127,23 @@ async def main():
 
 asyncio.run(main())
 ```
+
+---
+
+## 🔐 Security & Production
+
+Safe defaults work locally with zero setup. Before hosting ARDS publicly:
+
+| Setting | Why |
+| :--- | :--- |
+| `ARDS_ADMIN_TOKEN=<long random value>` | Admin actions (`DELETE`, `/api/v1/ops/sweep`, changing an existing id's endpoint) need `Authorization: Bearer <token>`. Without a token, they are allowed only from the same machine. |
+| `ARDS_ALLOW_LOCAL_ENDPOINTS=false` | Blocks registering `localhost`, private IPs, and cloud metadata addresses (SSRF protection, including IPv6 and DNS names that resolve to private IPs). |
+| `ARDS_HOST=0.0.0.0` only behind a proxy/load balancer | The CLI warns if you expose ARDS without an admin token. |
+
+Built-in protections: only `http(s)` endpoints are accepted (blocks `javascript:` links), field size limits, endpoint-takeover protection (`409` when someone re-registers an existing id with a different endpoint), security headers + CSP on HTML pages, and a `/healthz` probe for Cloud Run / Kubernetes.
+
+> [!NOTE]
+> With `uvicorn --workers N`, each worker runs its own Ops Brain. For multi-worker or multi-instance setups, run the server with `--mode frontend` and a single `ards ops-worker --auto-clean`.
 
 ---
 

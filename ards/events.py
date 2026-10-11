@@ -15,7 +15,7 @@ import logging
 import sqlite3
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from ards.config import ARDSConfig, settings
 
@@ -54,6 +54,8 @@ class InMemoryEventBus(EventBus):
 
     def __init__(self):
         self._subscribers: Dict[str, List[EventHandler]] = {}
+        # Strong refs to fire-and-forget tasks; asyncio only keeps weak refs, so untracked tasks can vanish.
+        self._pending_tasks: Set[asyncio.Task] = set()
 
     @property
     def provider_name(self) -> str:
@@ -80,7 +82,9 @@ class InMemoryEventBus(EventBus):
                 if inspect.isawaitable(res):
                     try:
                         loop = asyncio.get_running_loop()
-                        loop.create_task(res)
+                        task = loop.create_task(res)
+                        self._pending_tasks.add(task)
+                        task.add_done_callback(self._pending_tasks.discard)
                     except RuntimeError:
                         asyncio.run(res)
             except Exception as exc:
@@ -93,8 +97,9 @@ class SQLiteEventBus(EventBus):
     Ideal for testing or running decoupled Frontend + Ops Brain worker processes on a single host.
     """
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None, retention_seconds: float = 86400.0):
         self.db_path = db_path or settings.pubsub_sqlite_path or "ards_events.db"
+        self.retention_seconds = retention_seconds
         self._lock = threading.RLock()
         self._subscribers: Dict[str, List[EventHandler]] = {}
         self._shared_conn: Optional[sqlite3.Connection] = None
@@ -155,26 +160,41 @@ class SQLiteEventBus(EventBus):
     async def poll_once(self, topic: str = "*") -> int:
         with self._lock:
             conn = self._get_conn()
-            if topic == "*":
-                rows = conn.execute(
-                    "SELECT * FROM event_queue WHERE status = 'pending' ORDER BY id ASC LIMIT 50;"
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM event_queue WHERE status = 'pending' AND topic = ? ORDER BY id ASC LIMIT 50;",
-                    (topic,),
-                ).fetchall()
+            # BEGIN IMMEDIATE takes the write lock up front, so SELECT + UPDATE is one atomic claim.
+            # Without it, two worker processes could read the same pending rows and process them twice.
+            conn.isolation_level = None
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                if topic == "*":
+                    rows = conn.execute(
+                        "SELECT * FROM event_queue WHERE status = 'pending' ORDER BY id ASC LIMIT 50;"
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM event_queue WHERE status = 'pending' AND topic = ? ORDER BY id ASC LIMIT 50;",
+                        (topic,),
+                    ).fetchall()
 
-            ids = [r["id"] for r in rows]
-            if ids:
-                placeholders = ",".join("?" for _ in ids)
+                ids = [r["id"] for r in rows]
+                if ids:
+                    placeholders = ",".join("?" for _ in ids)
+                    conn.execute(
+                        f"UPDATE event_queue SET status = 'processed' WHERE id IN ({placeholders});",
+                        ids,
+                    )
+                # Retention: drop processed events older than the retention window.
                 conn.execute(
-                    f"UPDATE event_queue SET status = 'processed' WHERE id IN ({placeholders});",
-                    ids,
+                    "DELETE FROM event_queue WHERE status = 'processed' AND created_at < ?;",
+                    (time.time() - self.retention_seconds,),
                 )
-                conn.commit()
-            if self._shared_conn is None:
-                conn.close()
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+            finally:
+                conn.isolation_level = ""
+                if self._shared_conn is None:
+                    conn.close()
 
         processed = 0
         for row in rows:

@@ -99,10 +99,13 @@ async def execute_mcp_tool(payload: Dict[str, Any]):
     args = payload.get("arguments", {})
 
     if tool_name == "search_directory":
-        q = args.get("query", "")
+        q = str(args.get("query", ""))[:256]
         t = args.get("type_filter")
-        type_filter = ResourceType(t) if t else None
-        res = registry.search(query=q, type_filter=type_filter)
+        try:
+            type_filter = ResourceType(t) if t else None
+        except ValueError:
+            return {"error": f"Invalid type_filter '{t}'. Use one of: agent, mcp, skill, plugin."}
+        res = registry.search(query=q, type_filter=type_filter, limit=50)
         return {"total": res.total_results, "results": [r.model_dump() for r in res.results]}
 
     elif tool_name == "get_resource_details":

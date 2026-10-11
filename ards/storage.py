@@ -15,7 +15,7 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ards.config import ARDSConfig, settings
 from ards.models import ResourceRegistration, ResourceType, SearchResponse
@@ -24,6 +24,7 @@ logger = logging.getLogger("ards.storage")
 
 _SAFE_TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+")
 _BQ_IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+_BQ_PROJECT_RE = re.compile(r"^[a-z0-9.:-]+$")
 
 
 def default_seed_catalog() -> List[ResourceRegistration]:
@@ -470,10 +471,38 @@ class SQLiteBackend(StorageBackend):
 class BigQueryBackend(StorageBackend):
     """
     Online Cloud-Hosted Storage Backend using Google Cloud BigQuery.
-    Includes a high-speed L1 SQLite/in-memory read-through cache (configurable TTL)
-    so online deployments serve 100s+ RPS while persisting state in BigQuery.
-    Gracefully falls back to local L1 cache if GCP credentials or SDK are unavailable.
+
+    Design (built for 100s+ RPS):
+    - Reads are always served from a fast in-memory SQLite FTS5 cache (L1), never from BigQuery directly.
+    - The L1 cache refreshes from BigQuery in a background thread every `cache_ttl` seconds
+      (stale-while-revalidate), so requests never wait on a BigQuery round trip.
+    - Writes are append-only: every change (including deletes, as tombstones) is a new row with `updated_at`.
+      Reads keep only the latest row per id. This avoids BigQuery's limits on updating/deleting rows that
+      are still in the streaming buffer, and keeps a full change history for free.
+    - Gracefully falls back to the L1 cache only if GCP credentials or the SDK are unavailable.
     """
+
+    SCHEMA = [
+        ("id", "STRING", "REQUIRED"),
+        ("type", "STRING", "REQUIRED"),
+        ("name", "STRING", "NULLABLE"),
+        ("description", "STRING", "NULLABLE"),
+        ("endpoint", "STRING", "NULLABLE"),
+        ("version", "STRING", "NULLABLE"),
+        ("tags", "STRING", "REPEATED"),
+        ("capabilities", "STRING", "REPEATED"),
+        ("provider", "STRING", "NULLABLE"),
+        ("location", "STRING", "NULLABLE"),
+        ("schema_url", "STRING", "NULLABLE"),
+        ("metadata_json", "STRING", "NULLABLE"),
+        ("created_at", "FLOAT", "NULLABLE"),
+        ("health_status", "STRING", "NULLABLE"),
+        ("last_verified_at", "FLOAT", "NULLABLE"),
+        ("consecutive_failures", "INTEGER", "NULLABLE"),
+        ("verification_message", "STRING", "NULLABLE"),
+        ("updated_at", "FLOAT", "REQUIRED"),
+        ("deleted", "BOOLEAN", "NULLABLE"),
+    ]
 
     def __init__(
         self,
@@ -483,6 +512,7 @@ class BigQueryBackend(StorageBackend):
         cache_ttl: Optional[float] = None,
         seed_defaults: bool = True,
         bq_client: Optional[object] = None,
+        ensure_schema: bool = True,
     ):
         self.project = project or settings.google_cloud_project
         self.dataset = dataset or settings.bq_dataset
@@ -491,19 +521,38 @@ class BigQueryBackend(StorageBackend):
 
         if not _BQ_IDENTIFIER_RE.match(self.dataset) or not _BQ_IDENTIFIER_RE.match(self.table):
             raise ValueError("Invalid BigQuery dataset or table identifier.")
+        if self.project and not _BQ_PROJECT_RE.match(self.project):
+            raise ValueError("Invalid Google Cloud project identifier.")
 
-        # Fast L1 read-through cache (in-memory SQLite FTS5)
-        self._l1_cache = SQLiteBackend(db_path=":memory:", seed_defaults=seed_defaults)
+        # Fast L1 read cache (in-memory SQLite FTS5). Seeds go through self.register so they also reach BigQuery.
+        self._l1_cache = SQLiteBackend(db_path=":memory:", seed_defaults=False)
         self._last_sync_ts: float = 0.0
+        self._local_writes: Dict[str, float] = {}
+        self._refresh_lock = threading.Lock()
         self._bq_client = bq_client
         self._bq_available = False
-        self._init_bigquery()
+        self._init_bigquery(create_schema=ensure_schema and bq_client is None)
+
+        if self._bq_available:
+            self._refresh_from_bigquery()  # One blocking load at startup so the cache starts warm.
+        if seed_defaults and len(self._l1_cache.list_all()) == 0:
+            for item in default_seed_catalog():
+                self.register(item)
 
     @property
     def backend_name(self) -> str:
         return "bigquery+l1-cache" if self._bq_available else "bigquery-local-fallback"
 
-    def _init_bigquery(self) -> None:
+    @property
+    def is_available(self) -> bool:
+        """True when a BigQuery client is configured (real or injected)."""
+        return self._bq_available
+
+    @property
+    def _table_ref(self) -> str:
+        return f"{self.project}.{self.dataset}.{self.table}"
+
+    def _init_bigquery(self, create_schema: bool) -> None:
         if self._bq_client is not None:
             self._bq_available = True
             return
@@ -515,27 +564,78 @@ class BigQueryBackend(StorageBackend):
 
             self._bq_client = bigquery.Client(project=self.project)
             self._bq_available = True
+            if create_schema:
+                self._ensure_table(bigquery)
         except Exception as exc:
             logger.warning("BigQuery client unavailable (%s); falling back to L1 cache.", exc)
             self._bq_available = False
 
-    def _sync_from_bigquery_if_stale(self) -> None:
+    def _ensure_table(self, bigquery: Any) -> None:
+        """Creates the dataset and table if missing (idempotent)."""
+        try:
+            self._bq_client.create_dataset(f"{self.project}.{self.dataset}", exists_ok=True)
+            schema = [bigquery.SchemaField(n, t, mode=m) for n, t, m in self.SCHEMA]
+            self._bq_client.create_table(bigquery.Table(self._table_ref, schema=schema), exists_ok=True)
+        except Exception as exc:
+            logger.warning("Could not ensure BigQuery table %s: %s", self._table_ref, exc)
+
+    def _row_from_model(self, res: ResourceRegistration, deleted: bool = False) -> Dict[str, Any]:
+        return {
+            "id": res.id,
+            "type": res.type.value,
+            "name": res.name,
+            "description": res.description,
+            "endpoint": res.endpoint,
+            "version": res.version,
+            "tags": res.tags,
+            "capabilities": res.capabilities,
+            "provider": res.provider,
+            "location": res.location,
+            "schema_url": res.schema_url,
+            "metadata_json": json.dumps(res.metadata),
+            "created_at": res.created_at,
+            "health_status": res.health_status,
+            "last_verified_at": res.last_verified_at,
+            "consecutive_failures": res.consecutive_failures,
+            "verification_message": res.verification_message,
+            "updated_at": time.time(),
+            "deleted": deleted,
+        }
+
+    def _append_row(self, row: Dict[str, Any]) -> None:
         if not self._bq_available or self._bq_client is None:
             return
-        now = time.time()
-        if (now - self._last_sync_ts) < self.cache_ttl:
-            return
         try:
-            table_ref = f"{self.project}.{self.dataset}.{self.table}"
-            query = f"SELECT * FROM `{table_ref}` LIMIT 5000"
-            rows = list(self._bq_client.query(query).result())
+            errors = self._bq_client.insert_rows_json(self._table_ref, [row])
+            if errors:
+                logger.warning("BigQuery insert errors for %s: %s", row.get("id"), errors)
+        except Exception as exc:
+            logger.warning("BigQuery insert failed for %s: %s", row.get("id"), exc)
+
+    def _refresh_from_bigquery(self) -> None:
+        """Loads the latest live row per id from BigQuery into the L1 cache."""
+        if not self._bq_available or self._bq_client is None:
+            return
+        if not self._refresh_lock.acquire(blocking=False):
+            return  # A refresh is already running.
+        started = time.time()
+        try:
+            # Table ref is built only from validated identifiers; no user input reaches this SQL.
+            sql = (
+                f"SELECT * FROM `{self._table_ref}` "
+                "QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_at DESC) = 1"
+            )
+            rows = list(self._bq_client.query(sql).result())
+            live_ids = set()
             for r in rows:
+                if r.get("deleted"):
+                    continue
                 item = ResourceRegistration(
                     id=r["id"],
                     type=ResourceType(r["type"]),
-                    name=r["name"],
-                    description=r["description"],
-                    endpoint=r["endpoint"],
+                    name=r.get("name") or r["id"],
+                    description=r.get("description") or "",
+                    endpoint=r.get("endpoint") or "",
                     version=r.get("version") or "1.0.0",
                     tags=list(r.get("tags") or []),
                     capabilities=list(r.get("capabilities") or []),
@@ -543,71 +643,71 @@ class BigQueryBackend(StorageBackend):
                     location=r.get("location"),
                     schema_url=r.get("schema_url"),
                     metadata=json.loads(r["metadata_json"]) if r.get("metadata_json") else {},
-                    created_at=float(r.get("created_at") or now),
+                    created_at=float(r.get("created_at") or started),
                     health_status=r.get("health_status") or "healthy",
+                    last_verified_at=r.get("last_verified_at"),
+                    consecutive_failures=int(r.get("consecutive_failures") or 0),
+                    verification_message=r.get("verification_message"),
                 )
+                live_ids.add(item.id)
                 self._l1_cache.register(item)
-            self._last_sync_ts = now
+
+            # Drop cache entries removed in BigQuery (e.g. by another instance), but keep very recent
+            # local writes that may not be visible in query results yet.
+            for cached in self._l1_cache.list_all():
+                recent_local = (started - self._local_writes.get(cached.id, 0.0)) < max(self.cache_ttl, 5.0)
+                if cached.id not in live_ids and not recent_local:
+                    self._l1_cache.delete(cached.id)
+            self._last_sync_ts = started
         except Exception as exc:
-            logger.debug("BigQuery sync skipped: %s", exc)
-            self._last_sync_ts = now
+            logger.warning("BigQuery refresh failed (serving cached data): %s", exc)
+            self._last_sync_ts = started
+        finally:
+            self._refresh_lock.release()
+
+    def _refresh_if_stale(self) -> None:
+        """Stale-while-revalidate: start a background refresh and return immediately."""
+        if not self._bq_available:
+            return
+        if (time.time() - self._last_sync_ts) < self.cache_ttl or self._refresh_lock.locked():
+            return
+        threading.Thread(target=self._refresh_from_bigquery, name="ards-bq-refresh", daemon=True).start()
+
+    # Deprecated: blocking refresh inside the request path; replaced by `_refresh_if_stale`.
+    def _sync_from_bigquery_if_stale(self) -> None:
+        self._refresh_if_stale()
 
     def register(self, res: ResourceRegistration) -> ResourceRegistration:
         registered = self._l1_cache.register(res)
-        if self._bq_available and self._bq_client is not None:
-            try:
-                table_ref = f"{self.project}.{self.dataset}.{self.table}"
-                row = {
-                    "id": registered.id,
-                    "type": registered.type.value,
-                    "name": registered.name,
-                    "description": registered.description,
-                    "endpoint": registered.endpoint,
-                    "version": registered.version,
-                    "tags": registered.tags,
-                    "capabilities": registered.capabilities,
-                    "provider": registered.provider,
-                    "location": registered.location,
-                    "schema_url": registered.schema_url,
-                    "metadata_json": json.dumps(registered.metadata),
-                    "created_at": registered.created_at,
-                    "health_status": registered.health_status,
-                }
-                self._bq_client.insert_rows_json(table_ref, [row])
-            except Exception as exc:
-                logger.debug("BigQuery insert_rows_json deferred: %s", exc)
+        self._local_writes[registered.id] = time.time()
+        self._append_row(self._row_from_model(registered))
         return registered
 
     def get(self, res_id: str) -> Optional[ResourceRegistration]:
-        self._sync_from_bigquery_if_stale()
+        self._refresh_if_stale()
         return self._l1_cache.get(res_id)
 
     def delete(self, res_id: str) -> bool:
+        existing = self._l1_cache.get(res_id)
         deleted = self._l1_cache.delete(res_id)
-        if self._bq_available and self._bq_client is not None:
-            try:
-                from google.cloud import bigquery  # type: ignore
-
-                table_ref = f"{self.project}.{self.dataset}.{self.table}"
-                job_config = bigquery.QueryJobConfig(
-                    query_parameters=[bigquery.ScalarQueryParameter("res_id", "STRING", res_id)]
-                )
-                self._bq_client.query(
-                    f"DELETE FROM `{table_ref}` WHERE id = @res_id", job_config=job_config
-                )
-            except Exception as exc:
-                logger.debug("BigQuery delete deferred: %s", exc)
+        self._local_writes.pop(res_id, None)
+        if existing is not None:
+            # Tombstone row instead of DML DELETE (DML fails on rows still in the streaming buffer).
+            self._append_row(self._row_from_model(existing, deleted=True))
         return deleted
 
     def list_all(self, type_filter: Optional[ResourceType] = None) -> List[ResourceRegistration]:
-        self._sync_from_bigquery_if_stale()
+        self._refresh_if_stale()
         return self._l1_cache.list_all(type_filter=type_filter)
 
     def search(self, query: str = "", type_filter: Optional[ResourceType] = None) -> SearchResponse:
-        self._sync_from_bigquery_if_stale()
+        self._refresh_if_stale()
         resp = self._l1_cache.search(query=query, type_filter=type_filter)
         resp.backend = self.backend_name
         return resp
+
+    def close(self) -> None:
+        self._l1_cache.close()
 
 
 class VertexAISearchBackend(StorageBackend):
@@ -630,6 +730,7 @@ class VertexAISearchBackend(StorageBackend):
         self.data_store_id = data_store_id or settings.vertex_search_datastore_id
         self.local_store = local_store or SQLiteBackend()
         self.cache_ttl = cache_ttl
+        self.max_cache_entries = 2048
         self._query_cache: Dict[Tuple[str, Optional[str]], Tuple[float, List[str]]] = {}
         self._search_client = search_client
         self._vertex_available = False
@@ -638,6 +739,11 @@ class VertexAISearchBackend(StorageBackend):
     @property
     def backend_name(self) -> str:
         return "vertex-ai-semantic" if self._vertex_available else "vertex-local-fallback"
+
+    @property
+    def is_available(self) -> bool:
+        """True when a Vertex AI Search client is configured (real or injected)."""
+        return self._vertex_available
 
     def _init_vertex(self) -> None:
         if self._search_client is not None:
@@ -700,6 +806,8 @@ class VertexAISearchBackend(StorageBackend):
         except Exception as exc:
             logger.debug("Vertex AI Search call failed: %s", exc)
 
+        if len(self._query_cache) >= self.max_cache_entries:
+            self._query_cache.clear()  # Simple bound so many distinct queries can't exhaust memory.
         self._query_cache[cache_key] = (now, matched_ids)
         return matched_ids
 
@@ -761,7 +869,7 @@ class HybridBackend(StorageBackend):
 
     def register(self, res: ResourceRegistration) -> ResourceRegistration:
         registered = self.local.register(res)
-        if self.audit_bq._bq_available:
+        if self.audit_bq.is_available:
             self.audit_bq.register(registered)
         return registered
 
@@ -770,7 +878,7 @@ class HybridBackend(StorageBackend):
 
     def delete(self, res_id: str) -> bool:
         deleted = self.local.delete(res_id)
-        if self.audit_bq._bq_available:
+        if self.audit_bq.is_available:
             self.audit_bq.delete(res_id)
         return deleted
 
@@ -780,7 +888,7 @@ class HybridBackend(StorageBackend):
     def search(self, query: str = "", type_filter: Optional[ResourceType] = None) -> SearchResponse:
         start_time = time.perf_counter()
         resp = self.local.search(query=query, type_filter=type_filter)
-        if query.strip() and resp.total_results < self.min_lexical_results and self.semantic._vertex_available:
+        if query.strip() and resp.total_results < self.min_lexical_results and self.semantic.is_available:
             resp = self.semantic.search(query=query, type_filter=type_filter)
         resp.execution_time_ms = round((time.perf_counter() - start_time) * 1000.0, 3)
         resp.backend = self.backend_name
