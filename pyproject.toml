@@ -30,7 +30,18 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
+gcp = [
+    "google-cloud-bigquery>=3.20.0",
+    "google-cloud-discoveryengine>=0.11.0",
+    "google-cloud-pubsub>=2.21.0",
+]
+
+[project.scripts]
+ards = "ards.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["ards*", "demos*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

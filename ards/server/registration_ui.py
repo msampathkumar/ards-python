@@ -104,11 +104,20 @@ REGISTRATION_PAGE_HTML = """<!DOCTYPE html>
 </html>
 """
 
+from jinja2 import Environment
+
+_jinja_env = Environment(autoescape=True)
+_register_template = _jinja_env.from_string(REGISTRATION_PAGE_HTML)
+
+
 @register_router.get("/register", response_class=HTMLResponse)
 async def get_registration_page(request: Request):
-    html = REGISTRATION_PAGE_HTML.replace("{% if message %}", "").replace("{% endif %}", "")
-    html = html.replace("{{ message }}", "")
+    # Deprecated manual string replacement (left raw {% if success %} and empty alert box in HTML):
+    # html = REGISTRATION_PAGE_HTML.replace("{% if message %}", "").replace("{% endif %}", "")
+    # html = html.replace("{{ message }}", "")
+    html = _register_template.render(message=None, success=False)
     return HTMLResponse(html)
+
 
 @register_router.post("/register", response_class=HTMLResponse)
 async def submit_registration(
@@ -138,8 +147,10 @@ async def submit_registration(
 
     verified, msg = await verifier.verify(item)
     if not verified:
-        html = REGISTRATION_PAGE_HTML.replace("{{ message }}", f"Verification Failed: {msg}")
-        html = html.replace("{% if success %}", "").replace("{% else %}", "").replace("{% endif %}", "")
+        # Deprecated manual string replacement:
+        # html = REGISTRATION_PAGE_HTML.replace("{{ message }}", f"Verification Failed: {msg}")
+        # html = html.replace("{% if success %}", "").replace("{% else %}", "").replace("{% endif %}", "")
+        html = _register_template.render(message=f"Verification Failed: {msg}", success=False)
         return HTMLResponse(html)
 
     registered = registry.register(item)

@@ -40,7 +40,10 @@ class ResourceRegistration(BaseModel):
     schema_url: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
-    health_status: str = "healthy"  # healthy, degraded, unreachable
+    health_status: str = "healthy"  # healthy, provisional, degraded, unreachable
+    last_verified_at: Optional[float] = None
+    consecutive_failures: int = 0
+    verification_message: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -49,3 +52,4 @@ class SearchResponse(BaseModel):
     total_results: int
     execution_time_ms: float
     results: List[ResourceRegistration]
+    backend: Optional[str] = None
