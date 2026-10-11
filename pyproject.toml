@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ards-python"
+version = "0.1.0"
+description = "Agent & Resource Directory Service (ARDS) Python SDK and FastAPI Server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Sampath Kumar", email = "sam1990kumar@gmail.com"}
+]
+keywords = [
+    "a2a", "mcp", "agent2agent", "model-context-protocol",
+    "directory-service", "multi-agent", "fastapi", "discovery"
+]
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.28.0",
+    "pydantic>=2.6.0",
+    "httpx>=0.27.0",
+    "jinja2>=3.1.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ards*", "demos*"]
