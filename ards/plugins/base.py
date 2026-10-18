@@ -1,8 +1,11 @@
 """ARDS Plugin Architecture: Base Plugin Interface and Hook Lifecycle."""
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional
 from ards.models import ResourceRegistration, SearchResponse
+
+logger = logging.getLogger(__name__)
 
 
 class ARDSPlugin(ABC):
@@ -59,16 +62,16 @@ class PluginManager:
         for p in self._plugins.values():
             try:
                 await p.post_registration(resource)
-            except Exception as e:
-                # 2nd-order fault isolation: plugin failures must never crash core registry
-                pass
+            except Exception:
+                # Fault isolation: plugin failures must never crash the core registry.
+                logger.exception("plugin %s failed in post_registration", p.name)
 
     async def trigger_on_search(self, query: str, response: SearchResponse) -> SearchResponse:
         for p in self._plugins.values():
             try:
                 response = await p.on_search(query, response)
             except Exception:
-                pass
+                logger.exception("plugin %s failed in on_search", p.name)
         return response
 
 

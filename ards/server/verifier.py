@@ -1,10 +1,14 @@
 """Verification Pipeline for Human & Agent Resource Registration Submissions."""
 
-import httpx
+import logging
 import re
+
+import httpx
 from typing import Dict, Any, Tuple
 from urllib.parse import urlparse
 from ards.models import ResourceRegistration, ResourceType
+
+logger = logging.getLogger(__name__)
 
 
 class RegistrationVerifier:
@@ -43,7 +47,7 @@ class RegistrationVerifier:
                             return True, "VERIFIED: AgentCard successfully validated."
             except Exception:
                 # Fallback to accepting registration with 'unverified' trust badge
-                pass
+                logger.info("AgentCard probe failed for %s", probe_url, exc_info=True)
 
         elif submission.type == ResourceType.MCP:
             # Check for MCP endpoint connectivity
@@ -53,7 +57,7 @@ class RegistrationVerifier:
                     if resp.status_code < 500:
                         return True, "VERIFIED: MCP Server endpoint reachable."
             except Exception:
-                pass
+                logger.info("MCP probe failed for %s", submission.endpoint, exc_info=True)
 
         return True, "ACCEPTED: Registered with provisional health status."
 
