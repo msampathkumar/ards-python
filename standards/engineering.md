@@ -34,8 +34,10 @@ packages without a ticket that says so.
    `response_model` and at least one test hitting it via `ASGITransport`.
 2. Every public function/class added has a one-line docstring.
 3. Plugin hooks stay fault-isolated (a plugin error never fails a request),
-   but errors are **logged** with `logging.getLogger(__name__).exception(...)`,
-   never silently swallowed.
+   but errors are **logged** through the module logger
+   (`logger = logging.getLogger(__name__)`): `logger.exception(...)` for
+   unexpected errors, `logger.info(..., exc_info=True)` for expected probe
+   failures. Never silently swallowed.
 4. No module-level network calls; no network at import time.
 5. Configuration comes from environment variables named `ARDS_<NAME>` with
    a safe default documented in the README.

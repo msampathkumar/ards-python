@@ -40,7 +40,7 @@
 
 ## Failure handling
 - `tests: ards/ changed but no tests/test_*.py changed` → add the test from step 4; never weaken the gate.
-- `swallowed-exception` in a file you touched → replace `pass` with `logging.getLogger(__name__).exception("<context>")`.
+- `swallowed-exception` in a file you touched → replace `pass` with a module-logger call per `standards/engineering.md` code rule 3.
 - Dependency ticket still open (`next_item` skipped it) → do not work around it; pick what `next_item` prints.
 - Ticket needs a product or security decision → `tk update <id> --tags needs-owner` (append to existing tags), `tk status <id> open`, `tk add-note <id> "BLOCKED: needs owner: <question>"`, STOP.
 - Still failing after 2 fix loops → `tk add-note <id> "BLOCKED: <validator lines>"`, `tk update <id> --tags needs-owner` (append to existing tags), `tk status <id> open`, commit only `.tickets/`, do not commit code (`git stash` it), STOP.
