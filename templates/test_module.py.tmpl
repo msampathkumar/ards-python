@@ -1,0 +1,44 @@
+"""Tests for {{area}} ({{ticket-id}}).
+
+Copy to tests/test_{{area}}.py and replace every {{slot}}.
+Rules: standards/engineering.md "Test rules" — no real network, no sleep.
+Golden example: tests/test_full_suite.py.
+"""
+
+import httpx
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from ards.server.app import app
+
+
+# --- Unit test: pure logic, no I/O -------------------------------------------
+def test_{{behaviour}}_{{expected_result}}():
+    # Arrange: build the smallest input that exercises the acceptance criterion.
+    {{arrange}}
+    # Act
+    {{act}}
+    # Assert: one behaviour per test; assert the exact value, not just truthiness.
+    assert {{actual}} == {{expected}}
+
+
+# --- API test: in-process app via ASGITransport -----------------------------
+@pytest.mark.asyncio
+async def test_{{endpoint}}_returns_{{status}}():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.{{method}}("/api/v1/{{path}}")
+    assert resp.status_code == {{status}}
+    assert resp.json()["{{field}}"] == {{expected}}
+
+
+# --- Outbound HTTP: mock it, never hit the network ---------------------------
+@pytest.mark.asyncio
+async def test_{{fetcher}}_handles_{{case}}():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response({{status}}, json={{payload}})
+
+    mock = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=mock) as client:
+        {{call_code_under_test_with_client}}
+    assert {{actual}} == {{expected}}
