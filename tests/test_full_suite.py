@@ -54,3 +54,51 @@ async def test_ards_web_and_api():
         assert api_resp.status_code == 200
         data = api_resp.json()
         assert data["total_results"] >= 5
+
+import pytest
+from ards.server.verifier import RegistrationVerifier
+
+@pytest.mark.asyncio
+async def test_verifier_ssrf_rejections():
+    v = RegistrationVerifier()
+    
+    # 1. Reject localhost
+    res_local = ResourceRegistration(
+        id="test-local",
+        name="Localhost Agent",
+        type=ResourceType.AGENT,
+        endpoint="http://localhost:8000/agent",
+        description="Localhost testing"
+    )
+    ok, msg = await v.verify(res_local, allow_local=False)
+    assert not ok
+    assert "SECURITY_REJECTION" in msg
+
+    # 2. Reject 127.0.0.1
+    res_loopback = ResourceRegistration(
+        id="test-loopback",
+        name="Loopback Agent",
+        type=ResourceType.AGENT,
+        endpoint="http://127.0.0.1:8080/agent",
+        description="Loopback testing"
+    )
+    ok, msg = await v.verify(res_loopback, allow_local=False)
+    assert not ok
+    assert "SECURITY_REJECTION" in msg
+
+    # 3. Reject 169.254.169.254 (Cloud metadata)
+    res_meta = ResourceRegistration(
+        id="test-meta",
+        name="Metadata Agent",
+        type=ResourceType.AGENT,
+        endpoint="http://169.254.169.254/latest/meta-data",
+        description="Cloud metadata target"
+    )
+    ok, msg = await v.verify(res_meta, allow_local=False)
+    assert not ok
+    assert "SECURITY_REJECTION" in msg
+
+    # 4. Opt-in with allow_local=True allows local endpoint
+    ok_opt, msg_opt = await v.verify(res_local, allow_local=True)
+    # It will either be accepted or probe fail (unverified), but NOT security rejected
+    assert "SECURITY_REJECTION" not in msg_opt

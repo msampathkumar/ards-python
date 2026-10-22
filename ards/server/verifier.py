@@ -1,65 +1,67 @@
-"""Verification Pipeline for Human & Agent Resource Registration Submissions."""
-
-import logging
 import re
-
-import httpx
-from typing import Dict, Any, Tuple
+import socket
+import ipaddress
+import os
 from urllib.parse import urlparse
+from typing import Tuple
+import httpx
 from ards.models import ResourceRegistration, ResourceType
-
-logger = logging.getLogger(__name__)
-
 
 class RegistrationVerifier:
     """
-    Validates registration requests to protect the public ARDS directory.
-    - 2nd Order: Guards against dead links, malformed schemas, and namespace pollution.
-    - 3rd Order: Prevents SSRF attacks (blocking private IP ranges like 127.0.0.1, 169.254.169.254).
-    - 4th Order: Ensures ecosystem trust & interoperability.
+    Validates resource endpoints, schemas, and probes reachability with strict SSRF protection.
     """
 
-    PRIVATE_IP_REGEX = re.compile(
-        r"^(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+)"
-    )
+    @staticmethod
+    def is_private_or_local(hostname: str) -> bool:
+        if not hostname:
+            return True
+        h_lower = hostname.lower()
+        if h_lower in ("localhost", "0.0.0.0", "::1"):
+            return True
+        try:
+            addr_info = socket.getaddrinfo(hostname, None)
+            for family, _, _, _, sockaddr in addr_info:
+                ip_str = sockaddr[0]
+                ip = ipaddress.ip_address(ip_str)
+                if not ip.is_global:
+                    return True
+        except Exception:
+            return True
+        return False
 
-    async def verify(self, submission: ResourceRegistration, allow_local: bool = True) -> Tuple[bool, str]:
+    async def verify(self, submission: ResourceRegistration, allow_local: bool = False) -> Tuple[bool, str]:
+        env_allow_local = os.getenv("ARDS_ALLOW_LOCAL", "0").lower() in ("1", "true", "yes")
+        effective_allow_local = allow_local or env_allow_local
+
         # 1. URL syntax validation
         parsed = urlparse(submission.endpoint)
-        if not parsed.scheme or not parsed.netloc:
+        if not parsed.scheme or not parsed.netloc or parsed.scheme not in ("http", "https"):
             return False, "INVALID_ENDPOINT: Endpoint must be a valid HTTP/HTTPS URL."
 
-        # 2. SSRF Check (unless allow_local is True for local development/demos)
+        # 2. SSRF Check
         hostname = parsed.hostname or ""
-        if not allow_local and self.PRIVATE_IP_REGEX.match(hostname):
-            return False, "SECURITY_REJECTION: Registering internal/private IP ranges or cloud metadata endpoints is prohibited."
+        if not effective_allow_local and self.is_private_or_local(hostname):
+            return False, "SECURITY_REJECTION: Registering internal/private IP ranges, localhost, or unresolvable endpoints is prohibited."
 
         # 3. Type-specific verification probe
         if submission.type == ResourceType.AGENT:
-            # Probe AgentCard schema if schema_url provided
             probe_url = submission.schema_url or f"{submission.endpoint.rstrip('/')}/.well-known/agent.json"
+            probe_parsed = urlparse(probe_url)
+            probe_host = probe_parsed.hostname or ""
+            if not effective_allow_local and self.is_private_or_local(probe_host):
+                return False, "SECURITY_REJECTION: Schema URL targets internal/private address."
             try:
-                async with httpx.AsyncClient(timeout=4.0) as client:
+                async with httpx.AsyncClient(timeout=4.0, follow_redirects=False) as client:
                     resp = await client.get(probe_url)
                     if resp.status_code == 200:
                         data = resp.json()
-                        if "name" in data or "capabilities" in data or "protocol" in data:
-                            return True, "VERIFIED: AgentCard successfully validated."
-            except Exception:
-                # Fallback to accepting registration with 'unverified' trust badge
-                logger.info("AgentCard probe failed for %s", probe_url, exc_info=True)
+                        if "name" in data:
+                            return True, "VERIFIED: AgentCard schema detected."
+                    return True, "PROVISIONALLY_ACCEPTED: Agent responded without a valid standard AgentCard schema."
+            except Exception as e:
+                return True, f"UNVERIFIED: Agent endpoint registered, but initial probe failed ({str(e)})."
 
-        elif submission.type == ResourceType.MCP:
-            # Check for MCP endpoint connectivity
-            try:
-                async with httpx.AsyncClient(timeout=3.0) as client:
-                    resp = await client.get(submission.endpoint)
-                    if resp.status_code < 500:
-                        return True, "VERIFIED: MCP Server endpoint reachable."
-            except Exception:
-                logger.info("MCP probe failed for %s", submission.endpoint, exc_info=True)
-
-        return True, "ACCEPTED: Registered with provisional health status."
-
+        return True, "ACCEPTED"
 
 verifier = RegistrationVerifier()
